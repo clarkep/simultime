@@ -39,6 +39,7 @@ typedef struct time_input {
 	i32 field_dragging;
 	i32 cursor_i;
 	i32 cursor_j;
+	bool insert_mode;
 	bool dragging;
 	i32 drag_start_y;
 	i32 drag_field_start_value;
@@ -288,6 +289,45 @@ Vector2 time_input_get_size(Time_Input *self, Scene *parent)
 	return ret;
 }
 
+i32 character_index_at_x_offset(Scene *scene, i32 font, i32 font_size, char *text, float x)
+{
+	float pen_x = 0;
+	i32 i = 0;
+	while (pen_x < x && text[i]) {
+		pen_x += measure_text_widthf(scene, font, font_size, "%c", text[i]);
+		i++;
+	}
+	if (pen_x < x)
+		return -1;
+	else
+		return i-1;
+}
+
+static i32 log_base10(i32 x)
+{
+	i32 ret = 0;
+	while (x /= 10) ret++;
+	return ret;
+}
+
+static i32 replace_base10_digit(i32 x, i32 digit_i, i32 digit_value)
+{
+	i32 pow10 = 1;
+	for (i32 i=0; i<digit_i; i++) pow10 *= 10;
+	i32 pow10plus = pow10 * 10;
+
+	i32 d = (x % pow10plus) - (x % pow10);
+
+	return x - d + digit_value*pow10;
+}
+
+void time_input_void_selection(Time_Input *self)
+{
+	self->field_selected = -1;
+	self->cursor_j = -1;
+	self->insert_mode = false;
+}
+
 bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_State *input)
 {
 	float dpi = scene->window->scale;
@@ -295,8 +335,9 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 	Vector2 pointer = window_coords_to_scene(scene, input->pointer_x, input->pointer_y);
 
 	if (!self->initialized) {
-		self->cursor_i = -1;
 		self->field_selected = -1;
+		self->cursor_j = -1;
+		self->insert_mode = false;
 		self->field_clicking = -1;
 		self->field_dragging = -1;
 		self->initialized = true;
@@ -312,22 +353,29 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 	// fields[2] will be "." when show_fraction
 	char *seps[4] = { ":", ":", NULL, NULL};
 	bool any_field_hit = false;
-	for (i32 i=0; i<3; i++) {
+	bool text_input_consumed = false;
+	bool kb_commands_consumed = false;
+	i32 n_fields = 3;
+	for (i32 i=0; i<n_fields; i++) {
+		i32 field_len = MAX(log_base10(fields[i]) + 1, 2);
+		// First handle mouse interactions and possible drag-updates to fields[i].
 		float field_w = measure_text_widthf(scene, self->font, font_size, "%02d", fields[i]);
 		bool field_hit = in_rect(pointer.x, pointer.y, x, y-font_size, field_w, font_size);
 		any_field_hit = any_field_hit || field_hit;
 		bool hovered = (field_hit && !input->mouse_down[AU_MOUSE_BUTTON_LEFT]) || self->field_dragging == i;
 		creep_towards(&self->fields_hovered_t[i], hovered ? 1.0f : 0.0f, 10.0f*input->anim_dt_s);
 		if (field_hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]) {
-			if (self->field_selected != i)
-				self->field_selected = -1;
+			if (self->field_selected != i) {
+				time_input_void_selection(self);
+			}
 			self->field_clicking = i;
 			self->field_dragging = i;
 			self->drag_start_y = pointer.y;
 			self->drag_field_start_value = fields[i];
 		}
-		if (!field_hit && self->field_clicking == i)
+		if (self->field_clicking == i && !field_hit) {
 			self->field_clicking = -1;
+		}
 		if (input->mouse_released[AU_MOUSE_BUTTON_LEFT]) {
 			if (self->field_clicking == i) {
 				// don't unselect on second click
@@ -335,33 +383,105 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 				// 	self->field_selected = -1;
 				// else
 				self->field_selected = i;
+				char field_text[20];
+				// fractional part needs special formatting when implemented
+				snprintf(field_text, 20, "%02d", fields[i]);
+				self->cursor_j = character_index_at_x_offset(scene, self->font, font_size,
+					field_text, pointer.x - x);
 			}
 			if (self->field_dragging == i) {
 				self->field_dragging = -1;
 			}
 		}
 		if (self->field_dragging == i) {
-			float drag_px_per_val = 5.0f;
+			float drag_px_per_val = 5.0f * dpi;
 			fields[i] = self->drag_field_start_value + (self->drag_start_y - pointer.y) / drag_px_per_val;
 			if (i == 1 || i == 2) { // hour or minutes wrap around
-				// copypasta for arbitray limits
-				// if (new_value < self->min) {
-				// 	new_value = self->max + 1 - (self->min - new_value) % (self->max + 1 - self->min);
-				// } else if (new_value > self->max) {
-				// 	new_value = self->min + (new_value - self->min) % (self->max + 1 - self->min);
-				// }
 				fields[i] = positive_modulo(fields[i], 60);
 			} else {
-				i32 max = i == 0 ? 1000 : INT_MAX;
-				fields[i] = CLAMP(fields[i], 0, max);
+				i32 max = i == 0 ? 1000000000 : 1000;
+				fields[i] = CLAMP(fields[i], 0, max-1);
 				if (fields[i] == max || fields[i] == 0) {
 					// so that you can go past the end, and get immediate changes coming back
 					self->drag_field_start_value = fields[i];
 					self->drag_start_y = pointer.y;
 				}
 			}
+			// adjust cursor index for potential field length change
+			if (self->field_selected == i) {
+				i32 new_len = MAX(log_base10(fields[i]) + 1, 2);
+				self->cursor_j += (new_len - field_len);
+			}
 		}
 
+		// Handle keyboard updates to fields[i]
+		if (!text_input_consumed && self->field_selected == i && self->cursor_j >= 0
+			&& input->text_entered->length > 0) {
+			// prevent bug where we move cursor to next field, and it consumes input too.
+			text_input_consumed = true;
+			for (u64 entered_i=0; entered_i<input->text_entered->length; entered_i++) {
+				char c = input->text_entered->d[entered_i];
+				if (c >= '0' && c <= '9') {
+					i32 len = field_len;
+					i32 field_new;
+					if (self->insert_mode) { // "insert mode"
+						if (len < 9) // prevent overflow by only allowing 9 digits.
+							field_new = fields[i]*10 + c - '0';
+						else
+							field_new = fields[i];
+					} else {
+						field_new = replace_base10_digit(fields[i], len - 1 - self->cursor_j,
+							c - '0');
+					}
+					if (field_new < 60 || (i != 1 && i != 2)) {
+						fields[i] = field_new;
+						bool leftmost0_skip = i == 0 && len > 2 && self->cursor_j == 0 && c == '0';
+						if (self->cursor_j < len - 1 && !leftmost0_skip) {
+							self->cursor_j++;
+						} else if (self->field_selected == 1) {
+							self->field_selected++;
+							self->cursor_j = 0;
+						} else if (self->field_selected == 0 && !leftmost0_skip) {
+							if (fields[i])
+								self->insert_mode = true;
+							else { // we've entered a zero, don't insert?
+								self->field_selected++;
+								self->cursor_j = 0;
+							}
+						}
+					}
+				}
+			}
+		} else if (!kb_commands_consumed && self->field_selected == i && self->cursor_j >= 0) {
+			kb_commands_consumed = true;
+			// xx Handle other keys after all text input this frame, which technically could be
+			// incorrect, because e.g. text that comes in post-enter should be ignored.
+			if (input->key_pressed[AU_KEY_ENTER]) {
+				time_input_void_selection(self);
+			} else if (input->key_pressed[AU_KEY_ESCAPE]) {
+				fields[i] = 0;
+				self->cursor_j = CLAMP(self->cursor_j, 0, 1);
+				self->insert_mode = false;
+			} else if (input->key_pressed[AU_KEY_LEFT]) {
+				if (self->cursor_j > 0)
+					self->cursor_j--;
+				else if (i != 0) {
+					i32 left_field_len = MAX(log_base10(fields[i-1]) + 1, 2);
+					self->field_selected = i-1;
+					self->cursor_j = left_field_len-1;
+				}
+			} else if (input->key_pressed[AU_KEY_RIGHT]) {
+				if (!self->insert_mode && self->cursor_j < field_len - 1) {
+					self->cursor_j++;
+				} else if (i < n_fields-1) {
+					self->field_selected++;
+					self->cursor_j = 0;
+					self->insert_mode = false;
+				}
+			}
+		}
+
+		// fields[i] is now finalized, let's draw it.
 		i32 field_n = fields[i];
 
 		if (self->fields_hovered_t[i] > 0.0f || self->field_selected == i) {
@@ -384,12 +504,18 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 		for (i32 j=0; j < field_digits_length; j++) {
 			i8 digit = field_digits[field_digits_length-1-j];
 			u32 char_color = self->text_color;
-			if (self->cursor_i == i && self->cursor_j == j) {
+			if (self->field_dragging < 0 && self->field_selected == i && !self->insert_mode
+				&& self->cursor_j == j) {
 				char_color = my_blend_colors(char_color, 0xff000000, 0.25f);
 			}
 			float adv;
 			add_character(scene, self->font, font_size, '0' + digit, x, y, char_color, &adv);
 			x += adv;
+		}
+		if (self->field_dragging < 0 && self->field_selected == i && self->insert_mode) {
+			u32 cursor_color = my_blend_colors(self->text_color, 0xff000000, 0.25f);
+			// TODO: bad and font dependent
+			add_rectangle(scene, x - 1*dpi, y - font_size*0.75, 2*dpi, font_size*0.75, cursor_color);
 		}
 		if (seps[i]) {
 			float adv;
@@ -397,8 +523,9 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 			x += adv;
 		}
 	}
-	if (!any_field_hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT])
-		self->field_selected = -1;
+	if (!any_field_hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]) {
+		time_input_void_selection(self);
+	}
 	// reincorporate changes
 	u64 new_value = combine_time_fields(
 		(Time_Fields) {fields[0], fields[1], fields[2], fields[3], t.micros }
@@ -671,12 +798,12 @@ int main(int argc, char *argv[])
 		u32 text_color = 0xffffffff;
 
 		i32 old_type = app->panel.type;
-		if (input->key_pressed[AU_KEY_RIGHT]) {
+		if (input->key_pressed[AU_KEY_TAB]) {
 			app->panel.type = (app->panel.type == CLOCK_TYPE_COUNT - 1) ? 0
 				: app->panel.type + 1;
 			app->panel.content.v = widgets[app->panel.type];
 		}
-		if (input->key_pressed[AU_KEY_LEFT]) {
+		if (input->key_pressed[AU_KEY_BACKSPACE]) {
 			app->panel.type = (app->panel.type == 0) ? CLOCK_TYPE_COUNT -1
 				: app->panel.type - 1;
 			app->panel.content.v = widgets[app->panel.type];
