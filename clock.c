@@ -6,6 +6,32 @@
 #define VC_EXTRALEAN
 #include <Windows.h>
 
+typedef struct app App;
+
+// Global settings
+typedef struct app_settings {
+	u32 background_color;
+	i32 font;
+	float font_size_unscaled;
+	float name_font_size_unscaled;
+	u32 font_color;
+	u32 bottom_bar_color;
+	u32 bottom_bar_buttons_bg_color;
+	i32 bottom_bar_height;
+	u32 tab_bar_color;
+} App_Settings;
+
+/***** Helper types *****/
+
+typedef struct float_dynarray
+{
+	float *d;
+	u64 length;
+	u64 capacity;
+	u64 item_size;
+	Arena *arena;
+} Float_Dynarray;
+
 typedef struct time_fields {
 	i32 hours;
 	i32 minutes;
@@ -13,6 +39,8 @@ typedef struct time_fields {
 	i32 millis;
 	i32 micros;
 } Time_Fields;
+
+/***** UI Widget types ******/
 
 typedef enum {
 	BUTTON_TYPE_PLAY,
@@ -47,24 +75,9 @@ typedef struct time_input {
 	bool initialized;
 } Time_Input;
 
-typedef enum {
-	CLOCK_TYPE_CLOCK,
-	CLOCK_TYPE_TIMER,
-	CLOCK_TYPE_STOPWATCH,
-	CLOCK_TYPE_COUNT
-} clock_type_e;
-
-// Global settings
-typedef struct app_settings {
-	u32 background_color;
-	i32 font;
-	float font_size_unscaled;
-	float name_font_size_unscaled;
-	u32 font_color;
-} App_Settings;
+/***** Core clock types *****/
 
 typedef struct clock {
-	App_Settings *settings;
 	String name;
 } Clock;
 
@@ -77,14 +90,13 @@ typedef enum {
 } timer_state_e;
 
 typedef struct timer {
-	App_Settings *settings;
 	String name;
 	PPS_Button play_pause;
 	PPS_Button stop_button;
 	Time_Input time_input;
 	// The time the timer is set for
 	u64 interval;
-	// If running, the time the timer was started/restarted.
+	// If running, the timestamp at which the timer was started/restarted.
 	u64 start_time;
 	// If running, the time remaining when the timer was started. Otherwise, the paused value.
 	u64 start_value;
@@ -94,7 +106,6 @@ typedef struct timer {
 } Timer;
 
 typedef struct stopwatch {
-	App_Settings *settings;
 	String name;
 	PPS_Button play_pause;
 	PPS_Button stop_button;
@@ -106,25 +117,107 @@ typedef struct stopwatch {
 	bool initialized;
 } Stopwatch;
 
-typedef struct panel {
-	clock_type_e type;
+/***** "layout system" (see comment below): ******/
+
+typedef enum {
+	PANE_TYPE_CLOCK,
+	PANE_TYPE_TIMER,
+	PANE_TYPE_STOPWATCH,
+	PANE_TYPE_COUNT
+} pane_type_e;
+
+typedef struct pane {
+	pane_type_e type;
 	union {
 		Clock *clock;
 		Timer *timer;
 		Stopwatch *stopwatch;
+	} content;
+} Pane;
+
+typedef struct pane_dynarray {
+	Pane **d;
+	u64 length;
+	u64 capacity;
+	u64 item_size;
+	Arena *arena;
+} Pane_Dynarray;
+
+typedef struct tab_group
+{
+	Pane_Dynarray *children;
+	i32 active_tab;
+	bool active_tab_dragging;
+	float drag_start_pointer_x;
+	float drag_start_tab_x;
+} Tab_Group;
+
+typedef enum {
+	SPLIT_HORIZONTAL,
+	SPLIT_VERTICAL,
+	SPLIT_COUNT,
+} split_e;
+
+typedef struct layout_node_dynarray Layout_Node_Dynarray;
+
+typedef struct split_group
+{
+	split_e type;
+	Layout_Node_Dynarray *children;
+	Float_Dynarray *child_sizes;
+} Split_Group;
+
+typedef enum {
+	NODE_TYPE_SPLIT_GROUP,
+	NODE_TYPE_TAB_GROUP,
+	NODE_TYPE_COUNT
+} node_type_e;
+
+// Basically:
+// -"Layout nodes" are either split groups or tab groups.
+// -Split groups contain other layout nodes.
+// 		-Horizontal split groups contain vertical split groups or tab groups.
+//		-Vertical split groups contain horizontal split groups or tab groups.
+// -Tab groups contain panes, which are clocks, timers, or stopwatches.
+typedef struct layout_node {
+	node_type_e type;
+	union {
+		Split_Group *split_group;
+		Tab_Group *tab_group;
 		void *v;
 	} content;
-} Panel;
+} Layout_Node;
+
+typedef struct layout_node_dynarray
+{
+	Layout_Node **d;
+	u64 length;
+	u64 capacity;
+	u64 item_size;
+	Arena *arena;
+} Layout_Node_Dynarray;
+
+typedef struct bottom_bar
+{
+	// don't even try to make this a reusable widget
+	App *app;
+	float hover_t;
+} Bottom_Bar;
 
 typedef struct app {
-	App_Settings settings;
-	// todo: tree of panels.
-	Panel panel;
+	Split_Group *layout_root;
+	Bottom_Bar bottom_bar;
+	i32 clock_svg;
+	i32 stopwatch_svg;
+	i32 timer_svg;
+	float icon_size;
 } App;
+
+App_Settings settings;
 
 static i32 positive_modulo(i32 x, i32 m)
 {
-    return ((x % m) + m) % m;
+	return ((x % m) + m) % m;
 }
 
 bool in_rect(float x, float y, float rect_x, float rect_y, float rect_w, float rect_h)
@@ -190,7 +283,7 @@ Time_Fields split_time_fields(u64 micros)
 u64 combine_time_fields(Time_Fields fields)
 {
 	return (u64) fields.hours*3600000000 + (u64) fields.minutes*60000000
-	       + (u64) fields.seconds * 1000000 + (u64) fields.millis*1000 + (u64) fields.micros;
+		   + (u64) fields.seconds * 1000000 + (u64) fields.millis*1000 + (u64) fields.micros;
 }
 
 /************************************** Timing basics *********************************************/
@@ -395,7 +488,7 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 		}
 		if (self->field_dragging == i) {
 			float drag_px_per_val = 5.0f * dpi;
-			fields[i] = self->drag_field_start_value + (self->drag_start_y - pointer.y) / drag_px_per_val;
+			fields[i] = roundf(self->drag_field_start_value + (self->drag_start_y - pointer.y) / drag_px_per_val);
 			if (i == 1 || i == 2) { // hour or minutes wrap around
 				fields[i] = positive_modulo(fields[i], 60);
 			} else {
@@ -444,7 +537,7 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 						} else if (self->field_selected == 0 && !leftmost0_skip) {
 							if (fields[i])
 								self->insert_mode = true;
-							else { // we've entered a zero, don't insert?
+							else { // xx we've entered a zero, don't insert
 								self->field_selected++;
 								self->cursor_j = 0;
 							}
@@ -563,18 +656,18 @@ bool get_formatted_current_time(char *buf, i32 bufsize)
 void clock_draw_and_respond_input(Clock *self, Scene *scene, Input_State *input)
 {
 	float dpi = scene->window->scale;
-	App_Settings *set = self->settings;
 
-	float name_size = set->name_font_size_unscaled*dpi;
-	// Todo: putting baseline at y + font_size could cause overflow, need font metrics api
-	// TODO: don't allow name to intersect content
-	add_text(scene, set->font, name_size, self->name.d, 10*dpi, name_size + 10*dpi,
-		set->font_color);
+	// float name_size = settings.name_font_size_unscaled*dpi;
+	// // Todo: putting baseline at y + font_size could cause overflow, need font metrics api
+	// // TODO: don't allow name to intersect content
+	// add_text(scene, settings.font, name_size, self->name.d, 10*dpi, name_size + 10*dpi,
+	// 	settings.font_color);
 
 	char timebuf[20];
 	bool suc = get_formatted_current_time(timebuf, 20);
 	assertf(suc, NULL);
-	add_centered_text(scene, set->font, set->font_size_unscaled*dpi, timebuf, set->font_color);
+	add_centered_text(scene, settings.font, settings.font_size_unscaled*dpi, timebuf,
+		settings.font_color);
 }
 
 /************************************** Timer *****************************************************/
@@ -583,17 +676,18 @@ void clock_draw_and_respond_input(Clock *self, Scene *scene, Input_State *input)
 void timer_draw_and_respond_input(Timer *self, Scene *scene, Input_State *input)
 {
 	float dpi = scene->window->scale;
-	App_Settings *set = self->settings;
 
 	if (!self->initialized) {
+		self->interval = 60000000;
 		self->start_value = self->interval;
+		self->state = TIMER_STATE_READY;
 		self->play_pause.type = BUTTON_TYPE_PLAY;
 		self->play_pause.color = 0xffd0d0d0;
 		self->stop_button.type = BUTTON_TYPE_STOP;
 		self->stop_button.color = 0xffd0d0d0;
-		self->time_input.font = set->font;
-		self->time_input.font_size_unscaled = set->font_size_unscaled;
-		self->time_input.text_color = set->font_color;
+		self->time_input.font = settings.font;
+		self->time_input.font_size_unscaled = settings.font_size_unscaled;
+		self->time_input.text_color = settings.font_color;
 		self->initialized = true;
 	}
 
@@ -602,26 +696,27 @@ void timer_draw_and_respond_input(Timer *self, Scene *scene, Input_State *input)
 		float phase_max = 0.9;
 		float phase = fmod(self->flash_red, 1.0f);
 		float brightness = phase > phase_max ? (1 - phase) / (1 - phase_max)
-		                                     : phase / phase_max;
-		u32 flash_color = my_blend_colors(set->background_color, 0xff783a39, brightness);
+											 : phase / phase_max;
+		u32 flash_color = my_blend_colors(settings.background_color, 0xff783a39, brightness);
 		clear_background(scene, flash_color);
 		creep_towards(&self->flash_red, 0.0f, input->anim_dt_s*flash_red_frequency);
 	}
 
-	float name_size = set->name_font_size_unscaled*dpi;
-	// Todo: putting baseline at y + font_size could cause overflow, need font metrics api
-	// TODO: don't allow name to intersect content
-	add_text(scene, set->font, name_size, self->name.d, 10*dpi, name_size + 10*dpi,
-		set->font_color);
+	// float name_size = settings.name_font_size_unscaled*dpi;
+	// // Todo: putting baseline at y + font_size could cause overflow, need font metrics api
+	// // TODO: don't allow name to intersect content
+	// add_text(scene, settings.font, name_size, self->name.d, 10*dpi, name_size + 10*dpi,
+	// 	settings.font_color);
 
 	u64 now = now_timestamp();
-	u64 remaining = MAX((i64) self->start_value - (i64) (self->state == TIMER_STATE_RUNNING ? (now - self->start_time) : 0LL), 0LL);
+	i64 elapsed_since_start = self->state == TIMER_STATE_RUNNING ? (now - self->start_time) : 0LL;
+	u64 remaining = MAX((i64) self->start_value - elapsed_since_start, 0LL);
 	if (self->state != TIMER_STATE_READY) {
 		char timebuf[30];
 		bool suc = format_micros(timebuf, 30, remaining);
 		assertf(suc, NULL);
 		// y == scene->h / 2.0f
-		add_centered_text(scene, set->font, set->font_size_unscaled*dpi, timebuf, set->font_color);
+		add_centered_text(scene, settings.font, settings.font_size_unscaled*dpi, timebuf, settings.font_color);
 	} else {
 		// xx for now, time_input sizes and places itself in the parent scene, so that we can
 		// guarantee its text baseline is the same as above. Could of course just remove the above
@@ -687,7 +782,6 @@ void timer_draw_and_respond_input(Timer *self, Scene *scene, Input_State *input)
 void stopwatch_draw_and_respond_input(Stopwatch *self, Scene *scene, Input_State *input)
 {
 	float dpi = scene->window->scale;
-	App_Settings *set = self->settings;
 
 	if (!self->initialized) {
 		self->play_pause.type = BUTTON_TYPE_PLAY;
@@ -697,11 +791,11 @@ void stopwatch_draw_and_respond_input(Stopwatch *self, Scene *scene, Input_State
 		self->initialized = true;
 	}
 
-	float name_size = set->name_font_size_unscaled*dpi;
-	// Todo: putting baseline at y + font_size could cause overflow, need font metrics api
-	// TODO: don't allow name to intersect content
-	add_text(scene, set->font, name_size, self->name.d, 10*dpi, name_size + 10*dpi,
-		set->font_color);
+	// float name_size = settings.name_font_size_unscaled*dpi;
+	// // Todo: putting baseline at y + font_size could cause overflow, need font metrics api
+	// // TODO: don't allow name to intersect content
+	// add_text(scene, settings.font, name_size, self->name.d, 10*dpi, name_size + 10*dpi,
+	// 	settings.font_color);
 
 	u64 now = now_timestamp();
 	u64 elapsed = self->start_value + (self->running ? now - self->start_time : 0);
@@ -709,7 +803,7 @@ void stopwatch_draw_and_respond_input(Stopwatch *self, Scene *scene, Input_State
 	char timebuf[30];
 	bool suc = format_micros(timebuf, 30, elapsed);
 	assertf(suc, NULL);
-	add_centered_text(scene, set->font, set->font_size_unscaled*dpi, timebuf, set->font_color);
+	add_centered_text(scene, settings.font, settings.font_size_unscaled*dpi, timebuf, settings.font_color);
 
 	float button_gap = 20*dpi;
 
@@ -745,72 +839,319 @@ void stopwatch_draw_and_respond_input(Stopwatch *self, Scene *scene, Input_State
 
 }
 
-void panel_draw_and_respond_input(Panel *panel, Scene *scene, Input_State *input)
+Pane *create_pane(Arena *arena, pane_type_e type, String name)
 {
-	switch (panel->type) {
-	case CLOCK_TYPE_CLOCK:
-		clock_draw_and_respond_input(panel->content.clock, scene, input);
+	Pane *res = adalloc(arena, sizeof(Pane));
+	res->type = type;
+	switch (type) {
+		case PANE_TYPE_CLOCK:
+		res->content.clock = adalloc(arena, sizeof(Clock));
+		res->content.clock->name = name;
+		break;
+		case PANE_TYPE_TIMER:
+		res->content.timer = adalloc(arena, sizeof(Timer));
+		res->content.timer->name = name;
+		break;
+		case PANE_TYPE_STOPWATCH:
+		res->content.stopwatch = adalloc(arena, sizeof(Stopwatch));
+		res->content.stopwatch->name = name;
+		break;
+		default:
+		break;
+	}
+	return res;
+}
+
+Tab_Group *create_tab_group(Arena *arena)
+{
+	Tab_Group *res = adalloc(arena, sizeof(Tab_Group));
+	res->children = (Pane_Dynarray *) new_dynarray(arena, sizeof(Pane *));
+	res->active_tab = -1;
+	return res;
+}
+
+Layout_Node *create_tab_group_node(Arena *arena)
+{
+	Layout_Node *res = adalloc(arena, sizeof(Layout_Node));
+	res->type = NODE_TYPE_TAB_GROUP;
+	res->content.tab_group = create_tab_group(arena);
+	return res;
+}
+
+void tab_group_add_pane(Tab_Group *self, Pane *pane)
+{
+	dynarray_add(self->children, &pane);
+	if (self->active_tab < 0)
+		self->active_tab = 0;
+}
+
+// feels dumb
+String pane_name(Pane *p)
+{
+	switch (p->type) {
+	case PANE_TYPE_CLOCK:
+		return p->content.clock->name;
 	break;
-	case CLOCK_TYPE_TIMER:
-		timer_draw_and_respond_input(panel->content.timer, scene, input);
+	case PANE_TYPE_TIMER:
+		return p->content.timer->name;
 	break;
-	case CLOCK_TYPE_STOPWATCH:
-		stopwatch_draw_and_respond_input(panel->content.stopwatch, scene, input);
-	break;
-	default:
+	case PANE_TYPE_STOPWATCH:
+		return p->content.stopwatch->name;
 	break;
 	}
+}
+
+void tab_group_swap_children(Tab_Group *self, i32 i, i32 j)
+{
+	Pane *child_i = self->children->d[i];
+	self->children->d[i] = self->children->d[j];
+	self->children->d[j] = child_i;
+}
+
+void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State *input)
+{
+	float dpi = scene->window->scale;
+	Vector2 pointer = window_coords_to_scene(scene, input->pointer_x, input->pointer_y);
+
+	float top_bar_h = 40*dpi;
+	float tab_h = top_bar_h - 5*dpi;
+	float min_tab_w = 100*dpi;
+	i32 font = settings.font;
+	float font_size = settings.name_font_size_unscaled*dpi;
+	float tab_margin = 15*dpi;
+	float active_tab_slot_x;
+	float active_tab_w = -1;
+	float active_tab_left_w = -1;
+	float active_tab_right_w = -1;
+	if (self->children->length > 1) {
+		add_rectangle(scene, 0, 0, scene->w, top_bar_h, settings.tab_bar_color);
+		float x = 0;
+		for (u64 i=0; i<self->children->length; i++) {
+			Pane *child = self->children->d[i];
+			String name = pane_name(child);
+			float name_w = measure_text_width(scene, font, font_size, name.d);
+			float tab_w = MAX(name_w + 2*tab_margin, min_tab_w);
+			bool hit = in_rect(pointer.x, pointer.y, x, 0, tab_w, top_bar_h);
+			if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]) {
+				self->active_tab = i;
+				self->active_tab_dragging = true;
+				self->drag_start_pointer_x = pointer.x;
+				self->drag_start_tab_x = x;
+			}
+			float tab_right = x + tab_w;
+
+			// save these for the swap calculation below
+			if (self->active_tab == i + 1) {
+				active_tab_left_w = tab_w;
+			} else if (self->active_tab == i - 1)
+				active_tab_right_w = tab_w;
+
+			if (self->active_tab == i) {
+				active_tab_slot_x = x;
+				active_tab_w = tab_w;
+			} else if (i != self->children->length - 1 && i+1 != self->active_tab) {
+				add_rectangle(scene, tab_right, top_bar_h-20*dpi, 1*dpi, 15*dpi, 0xffa0a0a0);
+			}
+			if (i != self->active_tab)
+				add_text(scene, font, font_size, name.d, x + tab_margin, top_bar_h - 5*dpi, 0xffffffff);
+			// xx descent
+			x = tab_right;
+		}
+	}
+	if (input->mouse_released[AU_MOUSE_BUTTON_LEFT]) {
+		self->active_tab_dragging = false;
+	}
+	// draw active tab
+	if (self->active_tab >= 0) {
+		float x = active_tab_slot_x;
+		float slot_right = active_tab_slot_x + active_tab_w;
+		if (self->active_tab_dragging) {
+			x = self->drag_start_tab_x + pointer.x - self->drag_start_pointer_x;
+			float tab_swap_threshold = 0.6f;
+			// Condition: are we closer to our current spot, or where we would be if we swapped?
+			// (this is a good condition to avoid flipping back and forth)
+			if (self->active_tab < self->children->length - 1 &&
+				ABS(x - active_tab_slot_x) > ABS(x - (active_tab_slot_x + active_tab_right_w))) {
+				tab_group_swap_children(self, self->active_tab, self->active_tab + 1);
+				self->active_tab++;
+			} else if (self->active_tab > 0
+				&& ABS(x - active_tab_slot_x) > ABS(x - (active_tab_slot_x - active_tab_left_w))) {
+				tab_group_swap_children(self, self->active_tab, self->active_tab - 1);
+				self->active_tab--;
+			}
+		}
+		float tab_right = x + active_tab_w;
+		float tab_top = top_bar_h - tab_h;
+			Vector2 corners[4] = {
+				{ x, tab_top},
+				{ tab_right, tab_top },
+				{ tab_right, top_bar_h },
+				{ x, top_bar_h }
+			};
+			bool rounded[4] = { true, true, false, false };
+			add_rounded_quad(scene, corners, rounded, 8*dpi, settings.background_color);
+			String name = pane_name(self->children->d[self->active_tab]);
+			add_text(scene, font, font_size, name.d, x + tab_margin, top_bar_h - 5*dpi, 0xffffffff);
+	}
+
+	Scene child_scene = make_child_scene(scene, 0, top_bar_h, scene->w, scene->h - top_bar_h);
+
+	if (self->active_tab >= 0) {
+		if (input->key_pressed[AU_KEY_TAB]) {
+			self->active_tab = positive_modulo(self->active_tab + 1, self->children->length);
+		}
+		if (input->key_pressed[AU_KEY_BACKSPACE]) {
+			self->active_tab = positive_modulo(self->active_tab - 1, self->children->length);
+		}
+
+		Pane *active_pane = self->children->d[self->active_tab];
+		switch (active_pane->type) {
+		case PANE_TYPE_CLOCK:
+			clock_draw_and_respond_input(active_pane->content.clock, &child_scene, input);
+		break;
+		case PANE_TYPE_TIMER:
+			timer_draw_and_respond_input(active_pane->content.timer, &child_scene, input);
+		break;
+		case PANE_TYPE_STOPWATCH:
+			stopwatch_draw_and_respond_input(active_pane->content.stopwatch, &child_scene, input);
+		break;
+		default:
+		break;
+		}
+	}
+}
+
+Split_Group *create_split_group(Arena *arena, split_e type) {
+	Split_Group *res = adalloc(arena, sizeof(Split_Group));
+	res->type = type;
+	res->children = (Layout_Node_Dynarray *) new_dynarray(arena, sizeof(Layout_Node *));
+	res->child_sizes = (Float_Dynarray *) new_dynarray(arena, sizeof(float));
+	return res;
+}
+
+void split_group_add_node(Split_Group *self, Layout_Node *node, float size)
+{
+	assertf(size >= 0.0f && size <= 1.0f, NULL);
+	float remaining = 1 - size;
+	for (u64 i=0; i<self->child_sizes->length; i++) {
+		self->child_sizes->d[i] = self->child_sizes->d[i] * remaining;
+	}
+	dynarray_add(self->children, &node);
+	dynarray_add(self->child_sizes, &size);
+}
+
+void split_group_draw_and_respond_input(Split_Group *self, Scene *scene, Input_State *input)
+{
+	// TODO: this is a dummy implementation, obviously
+	tab_group_draw_and_respond_input(self->children->d[0]->content.tab_group, scene, input);
+}
+
+void bottom_bar_draw_and_respond_input(Bottom_Bar *self, Scene *scene, Input_State *input)
+{
+	float dpi = scene->window->scale;
+	App *app = self->app;
+	add_rectangle(scene, 0, 0, scene->w, scene->h, settings.bottom_bar_color);
+	float margin = 15*dpi;
+	float x = scene->w / 2.0f - (app->icon_size*1.5 + margin);
+
+	{
+		float plus_size = app->icon_size - 18.0f;
+		float plus_margin = 16.0f*dpi;
+
+		// u32 container_bg = 0xff303060;
+		u32 container_bg = settings.bottom_bar_buttons_bg_color;
+		float container_w = 3*app->icon_size + 3*margin + plus_size + 2*plus_margin;
+		float container_h = scene->h - 6*dpi;
+		float container_x = x - plus_size - 2*plus_margin;
+		float container_y = (scene->h - container_h) / 2.0f;
+		add_rounded_rectangle(scene, container_x, container_y, container_w, container_h,
+			container_h / 2.0f, container_bg);
+
+		// u32 plus_color = 0xffb0b0d0;
+		u32 plus_color = 0xffd0d0d0;
+		float plus_w = 4.0f*dpi;
+		float plus_x = container_x + plus_margin;
+		float plus_y = container_y + (container_h - plus_size) / 2.0f;
+		add_rectangle(scene, plus_x, plus_y + plus_size/2.0f - plus_w/2.0f, plus_size, plus_w, plus_color);
+		add_rectangle(scene, plus_x + plus_size/2.0f - plus_w/2.0f, plus_y, plus_w, plus_size, plus_color);
+	}
+
+	u32 icon_color = 0xffd0d0d0;
+	add_image_with_color(scene, app->clock_svg, x, 4*dpi, icon_color);
+	x += app->icon_size + margin;
+	add_image_with_color(scene, app->timer_svg, x, 4*dpi, icon_color);
+	x += app->icon_size + margin;
+	add_image_with_color(scene, app->stopwatch_svg, x, 4*dpi, icon_color);
 }
 
 int main(int argc, char *argv[])
 {
 	arena_init(&app_arena, 1 << 26, 1 << 26);
-	Window *win = create_window(&app_arena, 600, 600, "SimulTime", true);
+	Window *win = create_window(&app_arena, 1200, 800, "SimulTime", true);
 	Scene *scene = (Scene *) win;
 	Input_State *input = win->input;
+	float dpi = win->scale;
 
 	i32 font = load_font(scene, "NotoSans-Regular.ttf");
 
 	App *app = (App *) aalloc(&app_arena, sizeof(App));
-	app->settings = (App_Settings) { 0xff202030, font, 50, 20, 0xffffffff };
+	app->bottom_bar.app = app;
 
-	Clock *clock = (Clock *) aalloc(&app_arena, sizeof(Clock));
-	clock->settings = &app->settings;
-	clock->name = string_from("Clock 1");
+ 	settings = (App_Settings) {
+ 		.background_color = 0xff202038,
+ 		.font = font,
+ 		.font_size_unscaled = 50.0f,
+ 		.name_font_size_unscaled = 20.0f,
+ 		.font_color = 0xffffffff,
+		.bottom_bar_color = 0xff232833,
+		.bottom_bar_buttons_bg_color = 0xff2a303f,
+		.bottom_bar_height = 40,
+		.tab_bar_color = 0xff303040,
+	};
 
-	Timer *timer = (Timer *) aalloc(&app_arena, sizeof(Timer));
-	timer->settings = &app->settings;
-	timer->name = string_from("Timer 1");
-	timer->interval = 2 * 1000000; // 5 minutes
+	float icon_size = (settings.bottom_bar_height - 8)*dpi;
+	app->icon_size = icon_size;
+	app->clock_svg = load_image_at_size(scene, "res/clock.svg", "svg_alpha", icon_size, icon_size);
+	app->timer_svg = load_image_at_size(scene, "res/timer.svg", "svg_alpha", icon_size, icon_size);
+	app->stopwatch_svg = load_image_at_size(scene, "res/sw.svg", "svg_alpha", icon_size, icon_size);
 
-	Stopwatch *stopwatch = (Stopwatch *) aalloc(&app_arena, sizeof(Stopwatch));
-	stopwatch->settings = &app->settings;
-	stopwatch->name = string_from("Stopwatch 1");
-	stopwatch->start_time = now_timestamp();
-
-	void *widgets[3] = { clock, timer, stopwatch };
-
-	app->panel.type = CLOCK_TYPE_TIMER;
-	app->panel.content.timer = timer;
+	app->layout_root = create_split_group(&app_arena, SPLIT_VERTICAL);
+	Layout_Node *tabs = create_tab_group_node(&app_arena);
+	split_group_add_node(app->layout_root, tabs, 1.0f);
+	Pane *clock = create_pane(&app_arena, PANE_TYPE_CLOCK, string_from("Clock 1"));
+	tab_group_add_pane(tabs->content.tab_group, clock);
+	Pane *timer = create_pane(&app_arena, PANE_TYPE_TIMER, string_from("Timer 1"));
+	tab_group_add_pane(tabs->content.tab_group, timer);
+	Pane *stopwatch = create_pane(&app_arena, PANE_TYPE_STOPWATCH, string_from("Stopwatch 1"));
+	tab_group_add_pane(tabs->content.tab_group, stopwatch);
 
 	while (!input->quit) {
-		float dpi = win->scale;
+		dpi = win->scale;
 		u32 text_color = 0xffffffff;
 
-		i32 old_type = app->panel.type;
+		/*
+		i32 old_type = app->layout.type;
 		if (input->key_pressed[AU_KEY_TAB]) {
-			app->panel.type = (app->panel.type == CLOCK_TYPE_COUNT - 1) ? 0
-				: app->panel.type + 1;
-			app->panel.content.v = widgets[app->panel.type];
+			app->layout.type = (app->layout.type == NODE_TYPE_COUNT - 1) ? 0
+				: app->layout.type + 1;
+			app->layout.content.v = widgets[app->layout.type];
 		}
 		if (input->key_pressed[AU_KEY_BACKSPACE]) {
-			app->panel.type = (app->panel.type == 0) ? CLOCK_TYPE_COUNT -1
-				: app->panel.type - 1;
-			app->panel.content.v = widgets[app->panel.type];
+			app->layout.type = (app->layout.type == 0) ? NODE_TYPE_COUNT -1
+				: app->layout.type - 1;
+			app->layout.content.v = widgets[app->layout.type];
 		}
+		*/
 
-		clear_background(scene, app->settings.background_color);
- 		panel_draw_and_respond_input(&app->panel, scene, input);
+		clear_background(scene, settings.background_color);
+
+		Scene main_scene = make_child_scene(scene, 0, 0, scene->w, scene->h - settings.bottom_bar_height*dpi);
+		split_group_draw_and_respond_input(app->layout_root, &main_scene, input);
+
+		Scene bottom_bar_scene = make_child_scene(scene, 0, scene->h - settings.bottom_bar_height*dpi, scene->w,
+			settings.bottom_bar_height*dpi);
+		bottom_bar_draw_and_respond_input(&app->bottom_bar, &bottom_bar_scene, input);
+
 		commit_changes(win);
 		au_sleep(10);
 		update_input_state(win);
