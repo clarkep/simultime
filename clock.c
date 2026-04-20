@@ -1,4 +1,5 @@
 #include <autil.h>
+#include <float.h>
 #include <limits.h>
 #include <stdio.h>
 #include <math.h>
@@ -19,9 +20,19 @@ typedef struct app_settings {
 	u32 bottom_bar_buttons_bg_color;
 	i32 bottom_bar_height;
 	u32 tab_bar_color;
+	i32 x_button;
+	float x_button_size_unscaled;
+	float top_bar_h_unscaled;
+	u32 overlay_color;
 } App_Settings;
 
 /***** Helper types *****/
+
+typedef struct grab_state {
+	bool active;
+	bool starting;
+	bool stopping;
+} Grab_State;
 
 typedef struct float_dynarray
 {
@@ -77,7 +88,11 @@ typedef struct time_input {
 
 /***** Core clock types *****/
 
+typedef struct layout_node Layout_Node;
+typedef struct layout_node_dynarray Layout_Node_Dynarray;
+
 typedef struct clock {
+	Layout_Node *node;
 	String name;
 } Clock;
 
@@ -90,6 +105,7 @@ typedef enum {
 } timer_state_e;
 
 typedef struct timer {
+	Layout_Node *node;
 	String name;
 	PPS_Button play_pause;
 	PPS_Button stop_button;
@@ -101,11 +117,13 @@ typedef struct timer {
 	// If running, the time remaining when the timer was started. Otherwise, the paused value.
 	u64 start_value;
 	float flash_red;
+	float flash_percent;
 	timer_state_e state;
 	bool initialized;
 } Timer;
 
 typedef struct stopwatch {
+	Layout_Node *node;
 	String name;
 	PPS_Button play_pause;
 	PPS_Button stop_button;
@@ -119,35 +137,14 @@ typedef struct stopwatch {
 
 /***** "layout system" (see comment below): ******/
 
-typedef enum {
-	PANE_TYPE_CLOCK,
-	PANE_TYPE_TIMER,
-	PANE_TYPE_STOPWATCH,
-	PANE_TYPE_COUNT
-} pane_type_e;
-
-typedef struct pane {
-	pane_type_e type;
-	union {
-		Clock *clock;
-		Timer *timer;
-		Stopwatch *stopwatch;
-	} content;
-} Pane;
-
-typedef struct pane_dynarray {
-	Pane **d;
-	u64 length;
-	u64 capacity;
-	u64 item_size;
-	Arena *arena;
-} Pane_Dynarray;
-
 typedef struct tab_group
 {
-	Pane_Dynarray *children;
+	Layout_Node *node;
+	Layout_Node_Dynarray *children;
+	float scroll_x;
 	i32 active_tab;
 	bool active_tab_dragging;
+	bool active_tab_dragging_out;
 	float drag_start_pointer_x;
 	float drag_start_tab_x;
 } Tab_Group;
@@ -158,35 +155,58 @@ typedef enum {
 	SPLIT_COUNT,
 } split_e;
 
-typedef struct layout_node_dynarray Layout_Node_Dynarray;
-
 typedef struct split_group
 {
+	Layout_Node *node;
 	split_e type;
 	Layout_Node_Dynarray *children;
 	Float_Dynarray *child_sizes;
+	i32 child_border_grabbed;
+	bool have_resize_cursor;
+	bool initialized;
 } Split_Group;
 
 typedef enum {
 	NODE_TYPE_SPLIT_GROUP,
 	NODE_TYPE_TAB_GROUP,
+	NODE_TYPE_CLOCK,
+	NODE_TYPE_TIMER,
+	NODE_TYPE_STOPWATCH,
 	NODE_TYPE_COUNT
 } node_type_e;
 
 // Basically:
-// -"Layout nodes" are either split groups or tab groups.
-// -Split groups contain other layout nodes.
+// -"Layout nodes" are either split groups, tab groups, or panes(clocks, timers, and stopwatches).
+// -Split groups contain other split groups, or tab groups.
 // 		-Horizontal split groups contain vertical split groups or tab groups.
 //		-Vertical split groups contain horizontal split groups or tab groups.
-// -Tab groups contain panes, which are clocks, timers, or stopwatches.
+// -Tab groups only contain panes.
 typedef struct layout_node {
+	Layout_Node *parent;
 	node_type_e type;
 	union {
 		Split_Group *split_group;
 		Tab_Group *tab_group;
-		void *v;
+		Clock *clock;
+		Timer *timer;
+		Stopwatch *stopwatch;
 	} content;
 } Layout_Node;
+
+typedef enum {
+	SIDE_LEFT,
+	SIDE_RIGHT,
+	SIDE_TOP,
+	SIDE_BOTTOM,
+} side_e;
+
+typedef struct layout_target
+{
+	Layout_Node *node;
+	i32 child;
+	side_e side;
+	float score;
+} Layout_Target;
 
 typedef struct layout_node_dynarray
 {
@@ -201,19 +221,31 @@ typedef struct bottom_bar
 {
 	// don't even try to make this a reusable widget
 	App *app;
-	float hover_t;
+	float buttons_hover_t[3];
+	Layout_Target drop_target_overlay;
 } Bottom_Bar;
 
 typedef struct app {
-	Split_Group *layout_root;
+	Window *window;
+	Layout_Node *layout_root;
+	Layout_Node *focused_pane;
+	Layout_Target drop_target_overlay;
 	Bottom_Bar bottom_bar;
+	Grab_State grab_state;
 	i32 clock_svg;
-	i32 stopwatch_svg;
 	i32 timer_svg;
+	i32 stopwatch_svg;
+	i32 chime_wav;
 	float icon_size;
+	i32 n_clocks;
+	i32 n_timers;
+	i32 n_stopwatches;
 } App;
 
 App_Settings settings;
+// Right now we use the global app to handle pane numbers("Timer 1"), drop target overlay, grab
+// state, and focused panes.
+App *g_app;
 
 static i32 positive_modulo(i32 x, i32 m)
 {
@@ -317,7 +349,8 @@ bool format_micros(char *buf, i32 bufsize, u64 micros)
 bool play_pause_stop_button_dari(PPS_Button *self, Scene *scene, Input_State *input)
 {
 	float dpi = scene->window->scale;
-	bool hit = window_coords_in_scene(input->pointer_x, input->pointer_y, scene);
+	bool hit = window_coords_in_scene(input->pointer_x, input->pointer_y, scene)
+		&& !g_app->grab_state.active;
 	creep_towards(&self->hover_t, hit ? 1.0f : 0.0f, input->anim_dt_s * 10.0f);
 	// if (self->hover_t > 0) {
 	// 	u32 alpha = 0x20*self->hover_t;
@@ -455,9 +488,10 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 		float field_w = measure_text_widthf(scene, self->font, font_size, "%02d", fields[i]);
 		bool field_hit = in_rect(pointer.x, pointer.y, x, y-font_size, field_w, font_size);
 		any_field_hit = any_field_hit || field_hit;
-		bool hovered = (field_hit && !input->mouse_down[AU_MOUSE_BUTTON_LEFT]) || self->field_dragging == i;
+		bool hovered = (field_hit && !input->mouse_down[AU_MOUSE_BUTTON_LEFT]
+			&& !g_app->grab_state.active) || self->field_dragging == i;
 		creep_towards(&self->fields_hovered_t[i], hovered ? 1.0f : 0.0f, 10.0f*input->anim_dt_s);
-		if (field_hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]) {
+		if (field_hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT] && !g_app->grab_state.active) {
 			if (self->field_selected != i) {
 				time_input_void_selection(self);
 			}
@@ -465,6 +499,8 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 			self->field_dragging = i;
 			self->drag_start_y = pointer.y;
 			self->drag_field_start_value = fields[i];
+			g_app->grab_state.active = true;
+			g_app->grab_state.starting = true;
 		}
 		if (self->field_clicking == i && !field_hit) {
 			self->field_clicking = -1;
@@ -484,11 +520,14 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 			}
 			if (self->field_dragging == i) {
 				self->field_dragging = -1;
+				g_app->grab_state.active = false;
+				g_app->grab_state.stopping = true;
 			}
 		}
 		if (self->field_dragging == i) {
 			float drag_px_per_val = 5.0f * dpi;
-			fields[i] = roundf(self->drag_field_start_value + (self->drag_start_y - pointer.y) / drag_px_per_val);
+			fields[i] = roundf(self->drag_field_start_value
+			                   + (self->drag_start_y - pointer.y) / drag_px_per_val);
 			if (i == 1 || i == 2) { // hour or minutes wrap around
 				fields[i] = positive_modulo(fields[i], 60);
 			} else {
@@ -528,6 +567,7 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 					}
 					if (field_new < 60 || (i != 1 && i != 2)) {
 						fields[i] = field_new;
+						// This leftmost 0 is disappearing, so don't advance cursor
 						bool leftmost0_skip = i == 0 && len > 2 && self->cursor_j == 0 && c == '0';
 						if (self->cursor_j < len - 1 && !leftmost0_skip) {
 							self->cursor_j++;
@@ -608,7 +648,8 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 		if (self->field_dragging < 0 && self->field_selected == i && self->insert_mode) {
 			u32 cursor_color = my_blend_colors(self->text_color, 0xff000000, 0.25f);
 			// TODO: bad and font dependent
-			add_rectangle(scene, x - 1*dpi, y - font_size*0.75, 2*dpi, font_size*0.75, cursor_color);
+			add_rectangle(scene, x - 1*dpi, y - font_size*0.75, 2*dpi, font_size*0.75,
+				cursor_color);
 		}
 		if (seps[i]) {
 			float adv;
@@ -639,8 +680,9 @@ bool get_formatted_current_time(char *buf, i32 bufsize)
 	GetLocalTime(&loctime);
 	// TODO option somehow for 24-hour time
 	char *ampm;
-	if (loctime.wHour > 12) {
-		loctime.wHour -= 12;
+	if (loctime.wHour >= 12) {
+		if (loctime.wHour > 12)
+			loctime.wHour -= 12;
 		ampm = "PM";
 	} else {
 		if (loctime.wHour == 0) {
@@ -656,6 +698,12 @@ bool get_formatted_current_time(char *buf, i32 bufsize)
 void clock_draw_and_respond_input(Clock *self, Scene *scene, Input_State *input)
 {
 	float dpi = scene->window->scale;
+	Vector2 pointer = window_coords_to_scene(scene, input->pointer_x, input->pointer_y);
+
+	bool hit = in_rect(pointer.x, pointer.y, 0, 0, scene->w, scene->h) && !g_app->grab_state.active;
+	if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]) {
+		g_app->focused_pane = self->node;
+	}
 
 	// float name_size = settings.name_font_size_unscaled*dpi;
 	// // Todo: putting baseline at y + font_size could cause overflow, need font metrics api
@@ -676,6 +724,7 @@ void clock_draw_and_respond_input(Clock *self, Scene *scene, Input_State *input)
 void timer_draw_and_respond_input(Timer *self, Scene *scene, Input_State *input)
 {
 	float dpi = scene->window->scale;
+	Vector2 pointer = window_coords_to_scene(scene, input->pointer_x, input->pointer_y);
 
 	if (!self->initialized) {
 		self->interval = 60000000;
@@ -691,6 +740,11 @@ void timer_draw_and_respond_input(Timer *self, Scene *scene, Input_State *input)
 		self->initialized = true;
 	}
 
+	bool hit = in_rect(pointer.x, pointer.y, 0, 0, scene->w, scene->h) && !g_app->grab_state.active;
+	if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]) {
+		g_app->focused_pane = self->node;
+	}
+
 	if (self->flash_red) {
 		float flash_red_frequency = 1.2;
 		float phase_max = 0.9;
@@ -698,7 +752,8 @@ void timer_draw_and_respond_input(Timer *self, Scene *scene, Input_State *input)
 		float brightness = phase > phase_max ? (1 - phase) / (1 - phase_max)
 											 : phase / phase_max;
 		u32 flash_color = my_blend_colors(settings.background_color, 0xff783a39, brightness);
-		clear_background(scene, flash_color);
+		add_rectangle(scene, 0, 0, scene->w, scene->h, flash_color);
+		self->flash_percent = brightness;
 		creep_towards(&self->flash_red, 0.0f, input->anim_dt_s*flash_red_frequency);
 	}
 
@@ -716,7 +771,8 @@ void timer_draw_and_respond_input(Timer *self, Scene *scene, Input_State *input)
 		bool suc = format_micros(timebuf, 30, remaining);
 		assertf(suc, NULL);
 		// y == scene->h / 2.0f
-		add_centered_text(scene, settings.font, settings.font_size_unscaled*dpi, timebuf, settings.font_color);
+		add_centered_text(scene, settings.font, settings.font_size_unscaled*dpi, timebuf,
+			settings.font_color);
 	} else {
 		// xx for now, time_input sizes and places itself in the parent scene, so that we can
 		// guarantee its text baseline is the same as above. Could of course just remove the above
@@ -774,6 +830,36 @@ void timer_draw_and_respond_input(Timer *self, Scene *scene, Input_State *input)
 		self->state = TIMER_STATE_EXPIRED;
 		self->start_value = 0;
 		self->play_pause.type = BUTTON_TYPE_PLAY;
+		au_window_play_sound(scene->window, g_app->chime_wav);
+	}
+}
+
+void timer_run_in_background(Timer *self, double anim_dt_s)
+{
+	if (self->flash_red) {
+		float flash_red_frequency = 1.2;
+		float phase_max = 0.9;
+		float phase = fmod(self->flash_red, 1.0f);
+		float brightness = phase > phase_max ? (1 - phase) / (1 - phase_max)
+											 : phase / phase_max;
+		u32 flash_color = my_blend_colors(settings.background_color, 0xff783a39, brightness);
+		// clear_background(scene, flash_color);
+		self->flash_percent = brightness;
+		creep_towards(&self->flash_red, 0.0f, anim_dt_s*flash_red_frequency);
+	} else {
+		self->flash_percent = 0;
+	}
+
+	u64 now = now_timestamp();
+	i64 elapsed_since_start = self->state == TIMER_STATE_RUNNING ? (now - self->start_time) : 0LL;
+	u64 remaining = MAX((i64) self->start_value - elapsed_since_start, 0LL);
+	if (self->state == TIMER_STATE_RUNNING && remaining <= 0) {
+		// beep! beep!
+		self->flash_red = 3.0f;
+		self->state = TIMER_STATE_EXPIRED;
+		self->start_value = 0;
+		self->play_pause.type = BUTTON_TYPE_PLAY;
+		au_window_play_sound(g_app->window, g_app->chime_wav);
 	}
 }
 
@@ -782,6 +868,7 @@ void timer_draw_and_respond_input(Timer *self, Scene *scene, Input_State *input)
 void stopwatch_draw_and_respond_input(Stopwatch *self, Scene *scene, Input_State *input)
 {
 	float dpi = scene->window->scale;
+	Vector2 pointer = window_coords_to_scene(scene, input->pointer_x, input->pointer_y);
 
 	if (!self->initialized) {
 		self->play_pause.type = BUTTON_TYPE_PLAY;
@@ -789,6 +876,11 @@ void stopwatch_draw_and_respond_input(Stopwatch *self, Scene *scene, Input_State
 		self->stop_button.type = BUTTON_TYPE_STOP;
 		self->stop_button.color = 0xffd0d0d0;
 		self->initialized = true;
+	}
+
+	bool hit = in_rect(pointer.x, pointer.y, 0, 0, scene->w, scene->h) && !g_app->grab_state.active;
+	if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]) {
+		g_app->focused_pane = self->node;
 	}
 
 	// float name_size = settings.name_font_size_unscaled*dpi;
@@ -803,7 +895,8 @@ void stopwatch_draw_and_respond_input(Stopwatch *self, Scene *scene, Input_State
 	char timebuf[30];
 	bool suc = format_micros(timebuf, 30, elapsed);
 	assertf(suc, NULL);
-	add_centered_text(scene, settings.font, settings.font_size_unscaled*dpi, timebuf, settings.font_color);
+	add_centered_text(scene, settings.font, settings.font_size_unscaled*dpi, timebuf,
+		settings.font_color);
 
 	float button_gap = 20*dpi;
 
@@ -836,37 +929,242 @@ void stopwatch_draw_and_respond_input(Stopwatch *self, Scene *scene, Input_State
 		self->start_value = 0;
 		self->play_pause.type = BUTTON_TYPE_PLAY;
 	}
-
 }
 
-Pane *create_pane(Arena *arena, pane_type_e type, String name)
+/************************************** Layout ****************************************************/
+
+Layout_Node *get_default_focused_tab_group(Layout_Node *root)
 {
-	Pane *res = adalloc(arena, sizeof(Pane));
+	switch (root->type) {
+	case NODE_TYPE_CLOCK:
+	case NODE_TYPE_TIMER:
+	case NODE_TYPE_STOPWATCH:
+		return NULL;
+	break;
+	case NODE_TYPE_TAB_GROUP:
+		return root;
+	break;
+	case NODE_TYPE_SPLIT_GROUP: {
+		Split_Group *split_group = root->content.split_group;
+		if (split_group->children->length > 0) {
+			return get_default_focused_tab_group(split_group->children->d[0]);
+		} else {
+			return NULL;
+		}
+	} break;
+	default:
+		return NULL;
+	break;
+	}
+}
+
+Layout_Target get_layout_target_for_point_recurse(Layout_Node *node, float w, float h, float x,
+	float y)
+{
+	float dpi = g_app->window->scale;
+	Layout_Target null_target = { NULL, 0, 0 };
+	switch (node->type) {
+	case NODE_TYPE_CLOCK:
+	case NODE_TYPE_STOPWATCH:
+	case NODE_TYPE_TIMER:
+	return null_target;
+	break;
+	case NODE_TYPE_TAB_GROUP:
+		float top_bar_h = settings.top_bar_h_unscaled * dpi;
+		if (y < top_bar_h) {
+			return (Layout_Target) { node, 0, 0, 10e9 };
+		} else {
+			Tab_Group *tabs = node->content.tab_group;
+			if (tabs->active_tab)
+				return null_target;
+			Layout_Node *child = tabs->children->d[tabs->active_tab];
+			return get_layout_target_for_point_recurse(child, w, h-top_bar_h, x, y-top_bar_h);
+		}
+	break;
+	case NODE_TYPE_SPLIT_GROUP:
+		Split_Group *split = node->content.split_group;
+		switch (split->type) {
+		case SPLIT_HORIZONTAL: {
+			side_e side = x < w - x ? SIDE_LEFT : SIDE_RIGHT;
+			float dist = MIN(x, w - x);
+			float my_score = 10000.0f - dist;
+			Layout_Target my_target = { node, -1, side, my_score };
+			float child_x = 0;
+			// todo splitter width
+			float children_total_w = w - (split->children->length - 1.0f) * 1.0f;
+			for (u64 i=0; i<split->children->length; i++) {
+				Layout_Node *child = split->children->d[i];
+				float child_proportion = split->child_sizes->d[i];
+				float child_w = child_proportion*children_total_w;
+				if (x >= child_x && x < child_x + child_w) {
+					// If the child is not a vertical split group, propose adding one
+					if (!(child->type == NODE_TYPE_SPLIT_GROUP
+						&& child->content.split_group->type == SPLIT_VERTICAL)) {
+						float dist = MIN(y, h-y);
+						float score = 10000.0f - dist;
+						if (score > my_score) {
+							side_e side = y < h - y ? SIDE_TOP : SIDE_BOTTOM;
+							my_target = (Layout_Target) { node, i, side, score };
+						}
+					}
+					Layout_Target child_target = get_layout_target_for_point_recurse(child,
+						child_w, h, x - child_x, y);
+					if (child_target.score > my_score)
+						return child_target;
+					else
+						return my_target;
+				}
+				child_x += child_w + (i<split->children->length-1 ? 1 : 0);
+			}
+			// xx ?
+			return my_target;
+		} break;
+		case SPLIT_VERTICAL: {
+			side_e side = y < h - y ? SIDE_TOP : SIDE_BOTTOM;
+			float dist = min(y, h - y);
+			float my_score = 10000.0f - dist;
+			Layout_Target my_target = { node, -1, side, my_score };
+			float child_y = 0;
+			// todo splitter width
+			float children_total_h = h - (split->children->length - 1.0f) * 1.0f;
+			for (u64 i=0; i<split->children->length; i++) {
+				Layout_Node *child = split->children->d[i];
+				float child_proportion = split->child_sizes->d[i];
+				float child_h = child_proportion*children_total_h;
+				if (y >= child_y && y < child_y + child_h) {
+					// If the child is not a horizontal split group, propose adding one
+					if (!(child->type == NODE_TYPE_SPLIT_GROUP
+						&& child->content.split_group->type == SPLIT_HORIZONTAL)) {
+						float dist = MIN(x, w-y);
+						float score = 10000.0f - dist;
+						if (score > my_score) {
+							side_e side = x < w - x ? SIDE_LEFT : SIDE_RIGHT;
+							my_target = (Layout_Target) { node, i, side, score };
+						}
+					}
+					Layout_Target child_target = get_layout_target_for_point_recurse(child,
+						w, child_h, x, y - child_y);
+					if (child_target.score > my_score)
+						return child_target;
+					else return my_target;
+				}
+				child_y += child_h + (i<split->children->length-1 ? 1 : 0);
+			}
+			return my_target;
+		} break;
+		}
+	break;
+	default:
+	break;
+	}
+	return null_target;
+}
+
+Layout_Target get_layout_target_for_point(float x, float y)
+{
+	Window *window = g_app->window;
+	return get_layout_target_for_point_recurse(g_app->layout_root, window->width, window->height,
+		x, y);
+}
+
+void tab_group_add_pane(Layout_Node *tabs, Layout_Node *pane);
+void split_group_add_node(Layout_Node *split, Layout_Node *node, i32 index, float size);
+Layout_Node *create_tab_group_node(Arena *arena);
+Layout_Node *create_split_group_node(Arena *arena, split_e type);
+
+void add_pane_to_target(Layout_Node *pane, Layout_Target target)
+{
+	Layout_Node *node = target.node;
+	if (!node)
+		return;
+	switch (node->type) {
+	case NODE_TYPE_CLOCK:
+	case NODE_TYPE_TIMER:
+	case NODE_TYPE_STOPWATCH:
+		return;
+	break;
+	case NODE_TYPE_TAB_GROUP: {
+		tab_group_add_pane(node, pane);
+	} break;
+	case NODE_TYPE_SPLIT_GROUP: {
+		Split_Group *split = node->content.split_group;
+		if (target.child >= 0) {
+			// split the specified child by removing it, adding a split group, and readding it
+			// along with the new tab group/pane.
+			Layout_Node *child = split->children->d[target.child];
+			split_e split_type = split->type == SPLIT_HORIZONTAL ? SPLIT_VERTICAL
+			: SPLIT_HORIZONTAL;
+			Layout_Node *new_split = create_split_group_node(&app_arena, split_type);
+			split_group_add_node(new_split, child, 0, 1.0f);
+
+			// as below
+			Layout_Node *tabs = create_tab_group_node(&app_arena);
+			tab_group_add_pane(tabs, pane);
+			i32 index = target.side == SIDE_LEFT || target.side == SIDE_TOP ? 0
+				: 1;
+			split_group_add_node(new_split, tabs, index, 0.5f);
+
+			split->children->d[target.child] = new_split;
+			new_split->parent = node;
+		} else {
+			Layout_Node *tabs = create_tab_group_node(&app_arena);
+			tab_group_add_pane(tabs, pane);
+			i32 index = target.side == SIDE_LEFT || target.side == SIDE_TOP ? 0
+				: split->children->length;
+			split_group_add_node(node, tabs, index, 1.0f / (split->children->length+1));
+		}
+	} break;
+	}
+}
+
+void destroy_pane(Arena *arena, Layout_Node *pane)
+{
+	if (g_app->focused_pane == pane)
+		g_app->focused_pane = NULL;
+	// Todo: we leak tab names
+	afree(arena, (void *) pane->content.clock);
+	afree(arena, pane);
+}
+
+Layout_Node *create_pane_with_default_name(Arena *arena, node_type_e type)
+{
+	Layout_Node *res = adalloc(arena, sizeof(Layout_Node));
+	char *name = adalloc(arena, 20);
 	res->type = type;
 	switch (type) {
-		case PANE_TYPE_CLOCK:
+		case NODE_TYPE_CLOCK:
+		snprintf(name, 20, "Clock %d", ++g_app->n_clocks);
 		res->content.clock = adalloc(arena, sizeof(Clock));
-		res->content.clock->name = name;
+		res->content.clock->name = string_from(name);
+		res->content.clock->node = res;
 		break;
-		case PANE_TYPE_TIMER:
+		case NODE_TYPE_TIMER:
+		snprintf(name, 20, "Timer %d", ++g_app->n_timers);
 		res->content.timer = adalloc(arena, sizeof(Timer));
-		res->content.timer->name = name;
+		res->content.timer->name = string_from(name);
+		res->content.timer->node = res;
 		break;
-		case PANE_TYPE_STOPWATCH:
+		case NODE_TYPE_STOPWATCH:
+		snprintf(name, 20, "Stopwatch %d", ++g_app->n_stopwatches);
 		res->content.stopwatch = adalloc(arena, sizeof(Stopwatch));
-		res->content.stopwatch->name = name;
+		res->content.stopwatch->name = string_from(name);
+		res->content.stopwatch->node = res;
 		break;
 		default:
+		afree(arena, res);
+		afree(arena, name);
+		return NULL;
 		break;
-	}
+		}
 	return res;
 }
 
 Tab_Group *create_tab_group(Arena *arena)
 {
 	Tab_Group *res = adalloc(arena, sizeof(Tab_Group));
-	res->children = (Pane_Dynarray *) new_dynarray(arena, sizeof(Pane *));
+	res->children = (Layout_Node_Dynarray *) new_dynarray(arena, sizeof(Layout_Node *));
 	res->active_tab = -1;
+	res->scroll_x = 0;
 	return res;
 }
 
@@ -875,38 +1173,55 @@ Layout_Node *create_tab_group_node(Arena *arena)
 	Layout_Node *res = adalloc(arena, sizeof(Layout_Node));
 	res->type = NODE_TYPE_TAB_GROUP;
 	res->content.tab_group = create_tab_group(arena);
+	res->content.tab_group->node = res;
 	return res;
 }
 
-void tab_group_add_pane(Tab_Group *self, Pane *pane)
+void destroy_tab_group(Arena *arena, Layout_Node *node)
 {
+	Tab_Group *tabs = node->content.tab_group;
+	// destroy_dynarray(tabs->children)
+	afree(arena, tabs);
+	afree(arena, node);
+}
+
+void tab_group_add_pane(Layout_Node *tabs, Layout_Node *pane)
+{
+	assertf(tabs->type == NODE_TYPE_TAB_GROUP, NULL);
+	Tab_Group *self = tabs->content.tab_group;
 	dynarray_add(self->children, &pane);
+	pane->parent = tabs;
 	if (self->active_tab < 0)
 		self->active_tab = 0;
 }
 
 // feels dumb
-String pane_name(Pane *p)
+String pane_name(Layout_Node *p)
 {
 	switch (p->type) {
-	case PANE_TYPE_CLOCK:
+	case NODE_TYPE_CLOCK:
 		return p->content.clock->name;
 	break;
-	case PANE_TYPE_TIMER:
+	case NODE_TYPE_TIMER:
 		return p->content.timer->name;
 	break;
-	case PANE_TYPE_STOPWATCH:
+	case NODE_TYPE_STOPWATCH:
 		return p->content.stopwatch->name;
+	break;
+	default:
+		return NULLSTRING;
 	break;
 	}
 }
 
 void tab_group_swap_children(Tab_Group *self, i32 i, i32 j)
 {
-	Pane *child_i = self->children->d[i];
+	Layout_Node *child_i = self->children->d[i];
 	self->children->d[i] = self->children->d[j];
 	self->children->d[j] = child_i;
 }
+
+i32 split_group_remove_node(Layout_Node *split, Layout_Node *node);
 
 void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State *input)
 {
@@ -915,30 +1230,55 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 
 	float top_bar_h = 40*dpi;
 	float tab_h = top_bar_h - 5*dpi;
-	float min_tab_w = 100*dpi;
+	float min_tab_w = 150*dpi;
 	i32 font = settings.font;
 	float font_size = settings.name_font_size_unscaled*dpi;
-	float tab_margin = 15*dpi;
+	float text_y = (top_bar_h + font_size) / 2.0f + 2.0f;
+	float name_margin_left = 15*dpi;
+	float name_margin_right = 30*dpi;
+	float x_button_size = settings.x_button_size_unscaled*dpi;
+	float x_button_margin = 8*dpi;
+	float tab_x_button_y = top_bar_h - tab_h + (tab_h - x_button_size) / 2.0f + 2.0f*dpi;
+	float solo_x_button_y = (top_bar_h - x_button_size) / 2.0f + 2.0f*dpi;
+	u32 x_button_hover_color = 0xffe0e0e0;
+	u32 x_button_nohover_color = 0xffa0a0a0;
+	i32 tab_to_remove = -1;
+	bool kill_tab_to_remove = false;
 	float active_tab_slot_x;
 	float active_tab_w = -1;
 	float active_tab_left_w = -1;
 	float active_tab_right_w = -1;
 	if (self->children->length > 1) {
-		add_rectangle(scene, 0, 0, scene->w, top_bar_h, settings.tab_bar_color);
 		float x = 0;
+		add_rectangle(scene, 0, 0, scene->w, top_bar_h, settings.tab_bar_color);
 		for (u64 i=0; i<self->children->length; i++) {
-			Pane *child = self->children->d[i];
+			Layout_Node *child = self->children->d[i];
 			String name = pane_name(child);
 			float name_w = measure_text_width(scene, font, font_size, name.d);
-			float tab_w = MAX(name_w + 2*tab_margin, min_tab_w);
+			float tab_w = MAX(name_w + name_margin_left + name_margin_right + x_button_size
+				+ x_button_margin, min_tab_w);
+			float tab_right = x + tab_w;
 			bool hit = in_rect(pointer.x, pointer.y, x, 0, tab_w, top_bar_h);
-			if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]) {
+
+			float x_button_x = tab_right - x_button_size - x_button_margin;
+			// float x_button_y = top_bar_h - 12.5*dpi - x_button_size/2.0f;
+			bool x_button_hit = in_rect(pointer.x, pointer.y, x_button_x, tab_x_button_y,
+				x_button_size, x_button_size);
+
+			if (x_button_hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]
+				&& !g_app->grab_state.active) {
+				tab_to_remove = i;
+				kill_tab_to_remove = true;
+			} else if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]
+				&& !g_app->grab_state.active) {
 				self->active_tab = i;
 				self->active_tab_dragging = true;
 				self->drag_start_pointer_x = pointer.x;
 				self->drag_start_tab_x = x;
+				g_app->grab_state.active = true;
+				g_app->grab_state.starting = true;
+				g_app->focused_pane = self->children->d[i];
 			}
-			float tab_right = x + tab_w;
 
 			// save these for the swap calculation below
 			if (self->active_tab == i + 1) {
@@ -950,22 +1290,102 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 				active_tab_slot_x = x;
 				active_tab_w = tab_w;
 			} else if (i != self->children->length - 1 && i+1 != self->active_tab) {
-				add_rectangle(scene, tab_right, top_bar_h-20*dpi, 1*dpi, 15*dpi, 0xffa0a0a0);
+				add_rectangle(scene, tab_right, top_bar_h-22*dpi, 1*dpi, 15*dpi, 0xffa0a0a0);
 			}
-			if (i != self->active_tab)
-				add_text(scene, font, font_size, name.d, x + tab_margin, top_bar_h - 5*dpi, 0xffffffff);
-			// xx descent
+			if (i != self->active_tab) {
+				if (child->type == NODE_TYPE_TIMER) {
+					Timer *timer = child->content.timer;
+					timer_run_in_background(timer, input->anim_dt_s);
+					if (timer->flash_percent) {
+						u32 color = my_blend_colors(settings.background_color, 0xff783a39, timer->flash_percent);
+						add_rectangle(scene, x, top_bar_h - tab_h, tab_w, tab_h, color);
+					}
+				}
+				add_text(scene, font, font_size, name.d, x + name_margin_left, text_y,
+					0xffffffff);
+
+				u32 button_color = x_button_hit && !g_app->grab_state.active ? x_button_hover_color
+					: x_button_nohover_color;
+				add_image_with_color(scene, settings.x_button, x_button_x, tab_x_button_y,
+					button_color);
+			}
 			x = tab_right;
+			// Todo: will need to run some checks on tabs even if not showing them
+			if (x > scene->w)
+				break;
+		}
+	} else if (self->children->length == 1) {
+		bool hit = in_rect(pointer.x, pointer.y, 0, 0, scene->w, top_bar_h);
+		if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT] && !g_app->grab_state.active) {
+			self->active_tab_dragging = true;
+			self->drag_start_pointer_x = pointer.x;
+			g_app->grab_state.active = true;
+			g_app->grab_state.starting = true;
 		}
 	}
-	if (input->mouse_released[AU_MOUSE_BUTTON_LEFT]) {
+
+	if (self->active_tab_dragging && input->mouse_released[AU_MOUSE_BUTTON_LEFT]) {
 		self->active_tab_dragging = false;
+		g_app->grab_state.active = false;
+		g_app->grab_state.stopping = true;
 	}
 	// draw active tab
 	if (self->active_tab >= 0) {
-		float x = active_tab_slot_x;
-		float slot_right = active_tab_slot_x + active_tab_w;
+		bool solo = self->children->length == 1;
+		float x = solo ? 0 : active_tab_slot_x;
+		Layout_Node *child = self->children->d[self->active_tab];
+		String name = pane_name(child);
+		float flash_percent = 0.0f;
+		if (child->type == NODE_TYPE_TIMER) {
+			flash_percent = child->content.timer->flash_percent;
+		}
+		if (solo) {
+			// put x at the right of the pane, TODO: it doesn't work yet, should delete whole
+			// tab group.
+			active_tab_w = scene->w;
+			// float name_w = measure_text_width(scene, font, font_size, name.d);
+			// active_tab_w = name_w + name_margin_left + name_margin_right + x_button_size
+			// 	+ x_button_margin;
+			if (in_rect(pointer.x, pointer.y, 0, 0, scene->w, top_bar_h)
+				&& !g_app->grab_state.active) {
+				// u32 top_bar_hl_color = my_blend_colors(settings.background_color,
+				// 	settings.tab_bar_color, 0.75);
+				u32 top_bar_color;
+				if (flash_percent == 0.0f)
+					top_bar_color = my_blend_colors(settings.background_color,
+						0xffffffff, 0.08f);
+				else
+					top_bar_color = my_blend_colors(settings.background_color,
+						0xff783a39, flash_percent);
+				add_rectangle(scene, 0, 0, scene->w, top_bar_h, top_bar_color);
+			}
+		}
+		float slot_right = x + active_tab_w;
+
 		if (self->active_tab_dragging) {
+			if (in_rect(pointer.x, pointer.y, 0, 0, scene->w, top_bar_h)) {
+				if (self->active_tab_dragging_out) {
+					g_app->drop_target_overlay.node = NULL;
+				}
+				self->active_tab_dragging_out = false;
+			} else {
+				self->active_tab_dragging_out = true;
+			}
+		}
+		if (self->active_tab_dragging_out) {
+			Layout_Target target = get_layout_target_for_point(input->pointer_x, input->pointer_y);
+			if (input->mouse_released[AU_MOUSE_BUTTON_LEFT]) {
+				tab_to_remove = self->active_tab;
+				self->active_tab_dragging = false;
+				self->active_tab_dragging_out = false;
+				add_pane_to_target(self->children->d[self->active_tab], target);
+				g_app->drop_target_overlay.node = NULL;
+			} else {
+				g_app->drop_target_overlay = target;
+			}
+		}
+
+		if (self->active_tab_dragging && !solo && !self->active_tab_dragging_out) {
 			x = self->drag_start_tab_x + pointer.x - self->drag_start_pointer_x;
 			float tab_swap_threshold = 0.6f;
 			// Condition: are we closer to our current spot, or where we would be if we swapped?
@@ -980,8 +1400,9 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 				self->active_tab--;
 			}
 		}
-		float tab_right = x + active_tab_w;
-		float tab_top = top_bar_h - tab_h;
+		if (!solo) {
+			float tab_right = x + active_tab_w;
+			float tab_top = top_bar_h - tab_h;
 			Vector2 corners[4] = {
 				{ x, tab_top},
 				{ tab_right, tab_top },
@@ -989,9 +1410,43 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 				{ x, top_bar_h }
 			};
 			bool rounded[4] = { true, true, false, false };
-			add_rounded_quad(scene, corners, rounded, 8*dpi, settings.background_color);
-			String name = pane_name(self->children->d[self->active_tab]);
-			add_text(scene, font, font_size, name.d, x + tab_margin, top_bar_h - 5*dpi, 0xffffffff);
+			u32 color = settings.background_color;
+			if (flash_percent != 0.0f)
+				color = my_blend_colors(color, 0xff783a39, flash_percent);
+			add_rounded_quad(scene, corners, rounded, 8*dpi, color);
+		}
+
+		add_text(scene, font, font_size, name.d, x + name_margin_left, text_y, 0xffffffff);
+
+		float button_x = x + active_tab_w - x_button_size - x_button_margin;
+		float x_button_y = solo ? solo_x_button_y : tab_x_button_y;
+		bool button_hit = in_rect(pointer.x, pointer.y, button_x, x_button_y, x_button_size,
+			x_button_size);
+		// if (button_hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT])
+		// 	x_button_pressed = self->active_tab;
+		u32 button_color = button_hit && !g_app->grab_state.active ? x_button_hover_color
+			: x_button_nohover_color;
+		add_image_with_color(scene, settings.x_button, button_x, x_button_y, button_color);
+	}
+
+	// xx Could inform the tab that it's being killed, and then run one last goodbye frame...
+	if (tab_to_remove >= 0) {
+		if (kill_tab_to_remove)
+			destroy_pane(&app_arena, self->children->d[tab_to_remove]);
+		dynarray_remove(self->children, tab_to_remove);
+		if (tab_to_remove < self->active_tab) {
+			self->active_tab--;
+		} else if (tab_to_remove == self->active_tab) {
+			if (self->active_tab >= self->children->length) {
+				self->active_tab--;
+			}
+		}
+		if (self->children->length == 0) {
+			Layout_Node *node = self->node;
+			split_group_remove_node(node->parent, node);
+			destroy_tab_group(&app_arena, node);
+			return;
+		}
 	}
 
 	Scene child_scene = make_child_scene(scene, 0, top_bar_h, scene->w, scene->h - top_bar_h);
@@ -1004,20 +1459,32 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 			self->active_tab = positive_modulo(self->active_tab - 1, self->children->length);
 		}
 
-		Pane *active_pane = self->children->d[self->active_tab];
+		Layout_Node *active_pane = self->children->d[self->active_tab];
 		switch (active_pane->type) {
-		case PANE_TYPE_CLOCK:
+		case NODE_TYPE_CLOCK:
 			clock_draw_and_respond_input(active_pane->content.clock, &child_scene, input);
 		break;
-		case PANE_TYPE_TIMER:
+		case NODE_TYPE_TIMER:
 			timer_draw_and_respond_input(active_pane->content.timer, &child_scene, input);
 		break;
-		case PANE_TYPE_STOPWATCH:
+		case NODE_TYPE_STOPWATCH:
 			stopwatch_draw_and_respond_input(active_pane->content.stopwatch, &child_scene, input);
 		break;
 		default:
 		break;
 		}
+	}
+
+	Layout_Target *overlay = &g_app->drop_target_overlay;
+	if (overlay->node == self->node) {
+			Vector2 corners[4] = {
+				{ 1.0f, top_bar_h - tab_h},
+				{ min_tab_w, top_bar_h - tab_h },
+				{ min_tab_w, top_bar_h},
+				{ 1.0f, top_bar_h }
+			};
+			bool rounded[4] = { true, true, false, false };
+		add_rounded_quad(scene, corners, rounded, 8.0f*dpi, settings.overlay_color);
 	}
 }
 
@@ -1029,27 +1496,255 @@ Split_Group *create_split_group(Arena *arena, split_e type) {
 	return res;
 }
 
-void split_group_add_node(Split_Group *self, Layout_Node *node, float size)
+Layout_Node *create_split_group_node(Arena *arena, split_e type)
 {
+	Layout_Node *res = adalloc(arena, sizeof(Layout_Node));
+	res->type = NODE_TYPE_SPLIT_GROUP;
+	res->content.split_group = create_split_group(arena, type);
+	res->content.split_group->node = res;
+	return res;
+}
+
+void split_group_add_node(Layout_Node *split, Layout_Node *node, i32 index, float size)
+{
+	assertf(split->type == NODE_TYPE_SPLIT_GROUP, NULL);
+	Split_Group *self = split->content.split_group;
 	assertf(size >= 0.0f && size <= 1.0f, NULL);
 	float remaining = 1 - size;
 	for (u64 i=0; i<self->child_sizes->length; i++) {
 		self->child_sizes->d[i] = self->child_sizes->d[i] * remaining;
 	}
-	dynarray_add(self->children, &node);
-	dynarray_add(self->child_sizes, &size);
+	dynarray_insert(self->children, &node, index);
+	dynarray_insert(self->child_sizes, &size, index);
+	node->parent = split;
 }
+
+i32 split_group_find_child(Layout_Node *split, Layout_Node *node)
+{
+	assertf(split->type == NODE_TYPE_SPLIT_GROUP, NULL);
+	Split_Group *self = split->content.split_group;
+	for (u64 i=0; i<self->children->length; i++) {
+		Layout_Node *child = self->children->d[i];
+		if (child == node) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+i32 split_group_remove_node(Layout_Node *split, Layout_Node *node)
+{
+	assertf(split->type == NODE_TYPE_SPLIT_GROUP, NULL);
+	Split_Group *self = split->content.split_group;
+	i32 found = -1;
+	float remaining_size = 1.0f;
+	for (u64 i=0; i<self->children->length; i++) {
+		Layout_Node *child = self->children->d[i];
+		if (child == node) {
+			remaining_size = 1 - self->child_sizes->d[i];
+			dynarray_remove(self->children, i);
+			dynarray_remove(self->child_sizes, i);
+			found = i;
+			break;
+		}
+	}
+	if (found >= 0 && self->children->length > 1) {
+		for (u64 i=0; i<self->children->length; i++) {
+			Layout_Node *child = self->children->d[i];
+			self->child_sizes->d[i] = self->child_sizes->d[i] / remaining_size;
+		}
+		return found;
+	} else if (found >= 0) {
+		Layout_Node *parent = split->parent;
+		if (parent) {
+			i32 self_i = split_group_find_child(parent, split);
+			float self_size = parent->content.split_group->child_sizes->d[self_i];
+			split_group_remove_node(parent, split);
+			split_group_add_node(parent, self->children->d[0], self_i, self_size);
+			afree(&app_arena, self);
+			afree(&app_arena, split);
+		} else if (self->children->length == 1) {
+			self->child_sizes->d[0] = 1.0f;
+		}
+		return found;
+	} else {
+		return -1;
+	}
+}
+
+void layout_node_draw_and_respond_input(Layout_Node *node, Scene *scene, Input_State *input);
 
 void split_group_draw_and_respond_input(Split_Group *self, Scene *scene, Input_State *input)
 {
-	// TODO: this is a dummy implementation, obviously
-	tab_group_draw_and_respond_input(self->children->d[0]->content.tab_group, scene, input);
+	if (!self->initialized) {
+		self->child_border_grabbed = -1;
+		self->initialized = true;
+	}
+	Vector2 pointer = window_coords_to_scene(scene, input->pointer_x, input->pointer_y);
+	float border_w = 1.0f;
+	u32 border_color = 0xffb0b0b0;
+	Layout_Target *overlay = &g_app->drop_target_overlay;
+	i32 overlay_child_i = -1;
+	if (overlay->node == self->node) {
+		if (overlay->child >= 0)
+			overlay_child_i = overlay->child;
+	}
+
+	if (self->type == SPLIT_HORIZONTAL) {
+		float x = 0;
+		float children_total_w = scene->w - (self->children->length - 1);
+		for (u64 i=0; i<self->children->length; i++) {
+			Layout_Node *child = self->children->d[i];
+			float child_proportion = self->child_sizes->d[i];
+			float child_w = children_total_w * child_proportion;
+			if (i < self->children->length - 1) {
+				bool hit = in_rect(pointer.x, pointer.y, x+child_w-5.0f, 0, 10.0f, scene->h);
+				if (hit && !g_app->grab_state.active) {
+					au_window_set_cursor(g_app->window, AU_CURSOR_HORIZONTAL_RESIZE);
+					self->have_resize_cursor = true;
+				}
+				if (!hit && self->have_resize_cursor && self->child_border_grabbed < 0) {
+					au_window_set_cursor(g_app->window, AU_CURSOR_NORMAL);
+					self->have_resize_cursor = false;
+				}
+				if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]
+					&& !g_app->grab_state.active) {
+					self->child_border_grabbed = i;
+					g_app->grab_state.active = true;
+					g_app->grab_state.starting = true;
+				}
+				// TODO: BUG: resize doesn't properly follow cursor
+				if (self->child_border_grabbed == i) {
+					child_w += input->pointer_dx;
+					float new_prop = child_w / children_total_w;
+					float dprop = new_prop - child_proportion;
+					i32 children_left = (i64) self->children->length - i;
+					self->child_sizes->d[i] = new_prop;
+					for (u64 j=i; j<self->children->length; j++) {
+						self->child_sizes->d[j] -= dprop / (float) children_left;
+					}
+				}
+			}
+			Scene child_scene = make_child_scene(scene, x, 0, child_w, scene->h);
+			layout_node_draw_and_respond_input(child, &child_scene, input);
+			if (overlay_child_i == i) {
+				float preview_frac = 1 / 3.0f;
+				if (overlay->side == SIDE_TOP) {
+					add_rectangle(scene, x, 0, child_w, scene->h * preview_frac,
+						settings.overlay_color);
+				} else if (overlay->side == SIDE_BOTTOM) {
+					add_rectangle(scene, x, scene->h - scene->h*preview_frac, child_w,
+						scene->h*preview_frac, settings.overlay_color);
+				}
+			}
+			x += child_w;
+			if (i < self->children->length - 1) {
+				add_rectangle(scene, x, 0, border_w, scene->h, border_color);
+				x += border_w;
+			}
+		}
+	} else if (self->type == SPLIT_VERTICAL) {
+		float y = 0;
+		float children_total_height = scene->h - (self->children->length - 1);
+		for (u64 i=0; i<self->children->length; i++) {
+			Layout_Node *child = self->children->d[i];
+			float child_proportion = self->child_sizes->d[i];
+			float child_h = children_total_height * child_proportion;
+			if (i < self->children->length - 1) {
+				bool hit = in_rect(pointer.x, pointer.y, 0, y+child_h-5.0f, scene->w, 10.0f);
+				if (hit && !g_app->grab_state.active) {
+					au_window_set_cursor(scene->window, AU_CURSOR_VERTICAL_RESIZE);
+					self->have_resize_cursor = true;;
+				}
+				if (!hit && self->have_resize_cursor && self->child_border_grabbed < 0) {
+					au_window_set_cursor(scene->window, AU_CURSOR_NORMAL);
+					self->have_resize_cursor = false;
+				}
+				if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]
+					&& !g_app->grab_state.active) {
+					self->child_border_grabbed = i;
+					g_app->grab_state.active = true;
+					g_app->grab_state.starting = true;
+				}
+				// TODO: BUG: resize doesn't properly follow cursor
+				if (self->child_border_grabbed == i) {
+					child_h += input->pointer_dy;
+					float new_prop = child_h / children_total_height;
+					float dprop = new_prop - child_proportion;
+					i32 children_left = (i64) self->children->length - i;
+					self->child_sizes->d[i] = new_prop;
+					for (u64 j=i; j<self->children->length; j++) {
+						self->child_sizes->d[j] -= dprop / (float) children_left;
+					}
+				}
+			}
+			Scene child_scene = make_child_scene(scene, 0, y, scene->w, child_h);
+			layout_node_draw_and_respond_input(child, &child_scene, input);
+			if (overlay_child_i == i) {
+				float preview_frac = 1 / 3.0f;
+				if (overlay->side == SIDE_LEFT) {
+					add_rectangle(scene, 0, y, scene->w*preview_frac, child_h,
+						settings.overlay_color);
+				} else if (overlay->side == SIDE_RIGHT) {
+					add_rectangle(scene, scene->w - scene->w*preview_frac, y, scene->w*preview_frac,
+						child_h, settings.overlay_color);
+				}
+			}
+			y += child_h;
+			if (i < self->children->length - 1) {
+				add_rectangle(scene, 0, y, scene->w, border_w, border_color);
+				y += border_w;
+			}
+		}
+	}
+	if (self->child_border_grabbed >= 0 && input->mouse_released[AU_MOUSE_BUTTON_LEFT]) {
+		self->child_border_grabbed = -1;
+		g_app->grab_state.active = false;
+		g_app->grab_state.stopping = true;
+	}
+
+	if (overlay->node == self->node && overlay_child_i < 0) {
+		float frac = 1 / 3.0f;
+		u32 color = settings.overlay_color;
+		switch (overlay->side) {
+		case SIDE_LEFT:
+			add_rectangle(scene, 0, 0, scene->w * frac, scene->h, color);
+		break;
+		case SIDE_RIGHT: {
+			float w = scene->w * frac;
+			add_rectangle(scene, scene->w - w, 0, w, scene->h, color);
+		} break;
+		case SIDE_TOP:
+			add_rectangle(scene, 0, 0, scene->w, scene->h * frac, color);
+		break;
+		case SIDE_BOTTOM: {
+			float h = scene->h * frac;
+			add_rectangle(scene, 0, scene->h - h, scene->w, h, color);
+		} break;
+		}
+	}
+}
+
+void layout_node_draw_and_respond_input(Layout_Node *node, Scene *scene, Input_State *input)
+{
+	switch (node->type) {
+	case NODE_TYPE_SPLIT_GROUP:
+		split_group_draw_and_respond_input(node->content.split_group, scene, input);
+	break;
+	case NODE_TYPE_TAB_GROUP:
+		tab_group_draw_and_respond_input(node->content.tab_group, scene, input);
+	break;
+	default:
+	break;
+	}
 }
 
 void bottom_bar_draw_and_respond_input(Bottom_Bar *self, Scene *scene, Input_State *input)
 {
 	float dpi = scene->window->scale;
 	App *app = self->app;
+	Vector2 pointer = window_coords_to_scene(scene, input->pointer_x, input->pointer_y);
+
 	add_rectangle(scene, 0, 0, scene->w, scene->h, settings.bottom_bar_color);
 	float margin = 15*dpi;
 	float x = scene->w / 2.0f - (app->icon_size*1.5 + margin);
@@ -1072,16 +1767,35 @@ void bottom_bar_draw_and_respond_input(Bottom_Bar *self, Scene *scene, Input_Sta
 		float plus_w = 4.0f*dpi;
 		float plus_x = container_x + plus_margin;
 		float plus_y = container_y + (container_h - plus_size) / 2.0f;
-		add_rectangle(scene, plus_x, plus_y + plus_size/2.0f - plus_w/2.0f, plus_size, plus_w, plus_color);
-		add_rectangle(scene, plus_x + plus_size/2.0f - plus_w/2.0f, plus_y, plus_w, plus_size, plus_color);
+		add_rectangle(scene, plus_x, plus_y + plus_size/2.0f - plus_w/2.0f, plus_size, plus_w,
+			plus_color);
+		add_rectangle(scene, plus_x + plus_size/2.0f - plus_w/2.0f, plus_y, plus_w, plus_size,
+			plus_color);
 	}
 
+	i32 images[3] = { app->clock_svg, app->timer_svg, app->stopwatch_svg };
+	node_type_e types[3] = { NODE_TYPE_CLOCK, NODE_TYPE_TIMER, NODE_TYPE_STOPWATCH };
 	u32 icon_color = 0xffd0d0d0;
-	add_image_with_color(scene, app->clock_svg, x, 4*dpi, icon_color);
-	x += app->icon_size + margin;
-	add_image_with_color(scene, app->timer_svg, x, 4*dpi, icon_color);
-	x += app->icon_size + margin;
-	add_image_with_color(scene, app->stopwatch_svg, x, 4*dpi, icon_color);
+	for (i32 i=0; i<3; i++) {
+		u32 color = my_blend_colors(icon_color, 0xffffffff, self->buttons_hover_t[i]);
+		add_image_with_color(scene, images[i], x, 4*dpi, color);
+		bool hit = in_rect(pointer.x, pointer.y, x, 4*dpi, app->icon_size, app->icon_size)
+			&& !g_app->grab_state.active;
+		creep_towards(&self->buttons_hover_t[i], hit ? 1.0f : 0.0f, 10.0f*input->anim_dt_s);
+		if (hit && input->mouse_pressed[AU_MOUSE_BUTTON_LEFT]) {
+			Layout_Node *tabs_node;
+			if (g_app->focused_pane) {
+				tabs_node = g_app->focused_pane->parent;
+			} else {
+				tabs_node = get_default_focused_tab_group(g_app->layout_root);
+			}
+			Layout_Node *p = create_pane_with_default_name(&app_arena, types[i]);
+			tab_group_add_pane(tabs_node, p);
+			Tab_Group *tabs = tabs_node->content.tab_group;
+			tabs->active_tab = tabs->children->length - 1;
+		}
+		x += app->icon_size + margin;
+	}
 }
 
 int main(int argc, char *argv[])
@@ -1095,18 +1809,23 @@ int main(int argc, char *argv[])
 	i32 font = load_font(scene, "NotoSans-Regular.ttf");
 
 	App *app = (App *) aalloc(&app_arena, sizeof(App));
+	g_app = app;
+	app->window = win;
 	app->bottom_bar.app = app;
 
  	settings = (App_Settings) {
  		.background_color = 0xff202038,
  		.font = font,
  		.font_size_unscaled = 50.0f,
- 		.name_font_size_unscaled = 20.0f,
+ 		.name_font_size_unscaled = 18.0f,
  		.font_color = 0xffffffff,
 		.bottom_bar_color = 0xff232833,
 		.bottom_bar_buttons_bg_color = 0xff2a303f,
 		.bottom_bar_height = 40,
 		.tab_bar_color = 0xff303040,
+		.x_button_size_unscaled = 12.0f,
+		.top_bar_h_unscaled = 40.0f,
+		.overlay_color = 0x803030c0,
 	};
 
 	float icon_size = (settings.bottom_bar_height - 8)*dpi;
@@ -1115,19 +1834,35 @@ int main(int argc, char *argv[])
 	app->timer_svg = load_image_at_size(scene, "res/timer.svg", "svg_alpha", icon_size, icon_size);
 	app->stopwatch_svg = load_image_at_size(scene, "res/sw.svg", "svg_alpha", icon_size, icon_size);
 
-	app->layout_root = create_split_group(&app_arena, SPLIT_VERTICAL);
+	app->chime_wav = au_window_load_sound(win, "res/chime.wav", "wav");
+
+	// TODO: reload svgs on rescale
+	float x_button_size = settings.x_button_size_unscaled*dpi;
+	settings.x_button = load_image_at_size(scene, "res/x_button.svg", "svg_alpha", x_button_size,
+		x_button_size);
+
+	app->layout_root = create_split_group_node(&app_arena, SPLIT_HORIZONTAL);
 	Layout_Node *tabs = create_tab_group_node(&app_arena);
-	split_group_add_node(app->layout_root, tabs, 1.0f);
-	Pane *clock = create_pane(&app_arena, PANE_TYPE_CLOCK, string_from("Clock 1"));
-	tab_group_add_pane(tabs->content.tab_group, clock);
-	Pane *timer = create_pane(&app_arena, PANE_TYPE_TIMER, string_from("Timer 1"));
-	tab_group_add_pane(tabs->content.tab_group, timer);
-	Pane *stopwatch = create_pane(&app_arena, PANE_TYPE_STOPWATCH, string_from("Stopwatch 1"));
-	tab_group_add_pane(tabs->content.tab_group, stopwatch);
+	split_group_add_node(app->layout_root, tabs, 0, 1.0f);
+
+	Layout_Node *clock = create_pane_with_default_name(&app_arena, NODE_TYPE_CLOCK);
+	Layout_Node *timer = create_pane_with_default_name(&app_arena, NODE_TYPE_TIMER);
+	Layout_Node *stopwatch = create_pane_with_default_name(&app_arena, NODE_TYPE_STOPWATCH);
+	tab_group_add_pane(tabs, clock);
+	tab_group_add_pane(tabs, timer);
+	tab_group_add_pane(tabs, stopwatch);
+
+	// Layout_Node *tabs2 = create_tab_group_node(&app_arena);
+	// split_group_add_node(app->layout_root->content.split_group, tabs2, 1, 0.5f);
+	// Layout_Node *clock2 = create_pane_with_default_name(&app_arena, NODE_TYPE_CLOCK);
+	// tab_group_add_pane(tabs2->content.tab_group, clock2);
 
 	while (!input->quit) {
 		dpi = win->scale;
 		u32 text_color = 0xffffffff;
+
+		app->grab_state.starting = false;
+		app->grab_state.stopping = false;
 
 		/*
 		i32 old_type = app->layout.type;
@@ -1145,11 +1880,13 @@ int main(int argc, char *argv[])
 
 		clear_background(scene, settings.background_color);
 
-		Scene main_scene = make_child_scene(scene, 0, 0, scene->w, scene->h - settings.bottom_bar_height*dpi);
-		split_group_draw_and_respond_input(app->layout_root, &main_scene, input);
+		Scene main_scene = make_child_scene(scene, 0, 0, scene->w,
+			scene->h - settings.bottom_bar_height*dpi);
+		split_group_draw_and_respond_input(app->layout_root->content.split_group, &main_scene,
+			input);
 
-		Scene bottom_bar_scene = make_child_scene(scene, 0, scene->h - settings.bottom_bar_height*dpi, scene->w,
-			settings.bottom_bar_height*dpi);
+		Scene bottom_bar_scene = make_child_scene(scene, 0,
+			scene->h - settings.bottom_bar_height*dpi, scene->w, settings.bottom_bar_height*dpi);
 		bottom_bar_draw_and_respond_input(&app->bottom_bar, &bottom_bar_scene, input);
 
 		commit_changes(win);
