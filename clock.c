@@ -200,6 +200,11 @@ typedef enum {
 	SIDE_BOTTOM,
 } side_e;
 
+// As you drag a pane around, we generate layout targets representing nodes on the tree where the
+// pane will go if dropped. Layout targets are generated with get_layout_target_for_point and
+// applied with add_pane_to_target. The current target is put in g_app->drop_target_overlay for
+// previewing. The score is an implementation detail of get_layout_target_for_point; it ranks
+// targets based on how close your pointer is.
 typedef struct layout_target
 {
 	Layout_Node *node;
@@ -483,8 +488,8 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 	bool kb_commands_consumed = false;
 	i32 n_fields = 3;
 	for (i32 i=0; i<n_fields; i++) {
+		// First, handle mouse interactions and possible drag-updates to fields[i].
 		i32 field_len = MAX(log_base10(fields[i]) + 1, 2);
-		// First handle mouse interactions and possible drag-updates to fields[i].
 		float field_w = measure_text_widthf(scene, self->font, font_size, "%02d", fields[i]);
 		bool field_hit = in_rect(pointer.x, pointer.y, x, y-font_size, field_w, font_size);
 		any_field_hit = any_field_hit || field_hit;
@@ -646,6 +651,7 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 			x += adv;
 		}
 		if (self->field_dragging < 0 && self->field_selected == i && self->insert_mode) {
+			// insert mode cursor
 			u32 cursor_color = my_blend_colors(self->text_color, 0xff000000, 0.25f);
 			// TODO: bad and font dependent
 			add_rectangle(scene, x - 1*dpi, y - font_size*0.75, 2*dpi, font_size*0.75,
@@ -933,6 +939,7 @@ void stopwatch_draw_and_respond_input(Stopwatch *self, Scene *scene, Input_State
 
 /************************************** Layout ****************************************************/
 
+// Tab group to add panes to if no pane is currently focused.
 Layout_Node *get_default_focused_tab_group(Layout_Node *root)
 {
 	switch (root->type) {
@@ -1089,8 +1096,9 @@ void add_pane_to_target(Layout_Node *pane, Layout_Target target)
 	case NODE_TYPE_SPLIT_GROUP: {
 		Split_Group *split = node->content.split_group;
 		if (target.child >= 0) {
-			// split the specified child by removing it, adding a split group, and readding it
-			// along with the new tab group/pane.
+			// child >= 0 means we're splitting one of the children of target.node, not just
+			// adding a child to target.node. Split the specified child by removing it, adding a
+			// split group in its place, and readding it along with the new node.
 			Layout_Node *child = split->children->d[target.child];
 			split_e split_type = split->type == SPLIT_HORIZONTAL ? SPLIT_VERTICAL
 			: SPLIT_HORIZONTAL;
@@ -1121,7 +1129,7 @@ void destroy_pane(Arena *arena, Layout_Node *pane)
 {
 	if (g_app->focused_pane == pane)
 		g_app->focused_pane = NULL;
-	// Todo: we leak tab names
+	afree(arena, pane->content.clock->name.d);
 	afree(arena, (void *) pane->content.clock);
 	afree(arena, pane);
 }
@@ -1249,6 +1257,8 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 	float active_tab_left_w = -1;
 	float active_tab_right_w = -1;
 	if (self->children->length > 1) {
+		// Draw the inactive tabs, record position and width of active tab, run inactive timers,
+		// handle clicks and hovers on inactive tabs.
 		float x = 0;
 		add_rectangle(scene, 0, 0, scene->w, top_bar_h, settings.tab_bar_color);
 		for (u64 i=0; i<self->children->length; i++) {
@@ -1281,9 +1291,9 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 			}
 
 			// save these for the swap calculation below
-			if (self->active_tab == i + 1) {
+			if (self->active_tab == i + 1)
 				active_tab_left_w = tab_w;
-			} else if (self->active_tab == i - 1)
+			else if (self->active_tab == i - 1)
 				active_tab_right_w = tab_w;
 
 			if (self->active_tab == i) {
@@ -1297,7 +1307,8 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 					Timer *timer = child->content.timer;
 					timer_run_in_background(timer, input->anim_dt_s);
 					if (timer->flash_percent) {
-						u32 color = my_blend_colors(settings.background_color, 0xff783a39, timer->flash_percent);
+						u32 color = my_blend_colors(settings.background_color, 0xff783a39,
+							timer->flash_percent);
 						add_rectangle(scene, x, top_bar_h - tab_h, tab_w, tab_h, color);
 					}
 				}
@@ -1329,8 +1340,10 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 		g_app->grab_state.active = false;
 		g_app->grab_state.stopping = true;
 	}
-	// draw active tab
+
 	if (self->active_tab >= 0) {
+		// Draw the active tab(header), handle clicks hovers, and drags, including drags out of the
+		// tab group.
 		bool solo = self->children->length == 1;
 		float x = solo ? 0 : active_tab_slot_x;
 		Layout_Node *child = self->children->d[self->active_tab];
@@ -1388,8 +1401,8 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 		if (self->active_tab_dragging && !solo && !self->active_tab_dragging_out) {
 			x = self->drag_start_tab_x + pointer.x - self->drag_start_pointer_x;
 			float tab_swap_threshold = 0.6f;
-			// Condition: are we closer to our current spot, or where we would be if we swapped?
-			// (this is a good condition to avoid flipping back and forth)
+			// Swap condition: are we closer to our current spot, or where we would be if we
+			// swapped? (this is a good condition to avoid flipping back and forth).
 			if (self->active_tab < self->children->length - 1 &&
 				ABS(x - active_tab_slot_x) > ABS(x - (active_tab_slot_x + active_tab_right_w))) {
 				tab_group_swap_children(self, self->active_tab, self->active_tab + 1);
@@ -1429,6 +1442,7 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 		add_image_with_color(scene, settings.x_button, button_x, x_button_y, button_color);
 	}
 
+	// Remove a tab if it's deleted or moved out of the tab group
 	// xx Could inform the tab that it's being killed, and then run one last goodbye frame...
 	if (tab_to_remove >= 0) {
 		if (kill_tab_to_remove)
@@ -1449,6 +1463,7 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 		}
 	}
 
+	// Pass control the active pane
 	Scene child_scene = make_child_scene(scene, 0, top_bar_h, scene->w, scene->h - top_bar_h);
 
 	if (self->active_tab >= 0) {
@@ -1475,6 +1490,7 @@ void tab_group_draw_and_respond_input(Tab_Group *self, Scene *scene, Input_State
 		}
 	}
 
+	// Draw a potential overlay
 	Layout_Target *overlay = &g_app->drop_target_overlay;
 	if (overlay->node == self->node) {
 			Vector2 corners[4] = {
@@ -1537,6 +1553,7 @@ i32 split_group_remove_node(Layout_Node *split, Layout_Node *node)
 	assertf(split->type == NODE_TYPE_SPLIT_GROUP, NULL);
 	Split_Group *self = split->content.split_group;
 	i32 found = -1;
+	// Iterate children to find child index 'found' of node
 	float remaining_size = 1.0f;
 	for (u64 i=0; i<self->children->length; i++) {
 		Layout_Node *child = self->children->d[i];
@@ -1555,6 +1572,8 @@ i32 split_group_remove_node(Layout_Node *split, Layout_Node *node)
 		}
 		return found;
 	} else if (found >= 0) {
+		// If a split group is left with only one child, and it's not the root split group, it
+		// is pruned since it's not actually splitting anything.
 		Layout_Node *parent = split->parent;
 		if (parent) {
 			i32 self_i = split_group_find_child(parent, split);
@@ -1625,8 +1644,10 @@ void split_group_draw_and_respond_input(Split_Group *self, Scene *scene, Input_S
 					}
 				}
 			}
+
 			Scene child_scene = make_child_scene(scene, x, 0, child_w, scene->h);
 			layout_node_draw_and_respond_input(child, &child_scene, input);
+
 			if (overlay_child_i == i) {
 				float preview_frac = 1 / 3.0f;
 				if (overlay->side == SIDE_TOP) {
@@ -1678,8 +1699,10 @@ void split_group_draw_and_respond_input(Split_Group *self, Scene *scene, Input_S
 					}
 				}
 			}
+
 			Scene child_scene = make_child_scene(scene, 0, y, scene->w, child_h);
 			layout_node_draw_and_respond_input(child, &child_scene, input);
+
 			if (overlay_child_i == i) {
 				float preview_frac = 1 / 3.0f;
 				if (overlay->side == SIDE_LEFT) {
@@ -1859,7 +1882,6 @@ int main(int argc, char *argv[])
 
 	while (!input->quit) {
 		dpi = win->scale;
-		u32 text_color = 0xffffffff;
 
 		app->grab_state.starting = false;
 		app->grab_state.stopping = false;
