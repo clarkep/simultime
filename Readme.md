@@ -1,5 +1,7 @@
 # SimulTime: clock, timer and stopwatch
 
+_Warning: this project is incomplete, and has a number of bugs and rough edges._
+
 Inspired by the fact that OS Clock apps don't let you set more than one stopwatch, SimulTime lets you have whatever clocks you want, in whatever arrangement you want.
 
 This app was originally built as part of the [Handmade Essentials Jam 2026](https://handmade.network/jam/essentials) ([project page](https://handmade.network/p/800/simultime/)). As per the jam rules, no AI code generation was used in its creation(the library code in `autil/` was written before the jam, and did make minor use of AI assistance). Subsequent updates will continue to use no AI codegen.
