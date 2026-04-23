@@ -1,11 +1,17 @@
-#include <autil.h>
+#include "autil.h"
 #include <float.h>
 #include <limits.h>
 #include <stdio.h>
 #include <math.h>
+
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define VC_EXTRALEAN
 #include <Windows.h>
+#else
+#include <time.h>
+#include <sys/time.h>
+#endif
 
 typedef struct app App;
 
@@ -328,10 +334,16 @@ u64 combine_time_fields(Time_Fields fields)
 // Microseconds since Jan 1, 1601, UTC. TODO: use unix epoch?
 u64 now_timestamp()
 {
+#ifdef _WIN32
 	FILETIME ftime;
 	GetSystemTimePreciseAsFileTime(&ftime);
 	u64 t = ((u64) ftime.dwHighDateTime << 32) | ((u64) ftime.dwLowDateTime);
 	return t / 10;
+#else
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (u64) tv.tv_sec * 1000000 + (u64) tv.tv_usec;
+#endif
 }
 
 bool format_micros(char *buf, i32 bufsize, u64 micros)
@@ -679,6 +691,7 @@ bool time_input_draw_and_respond_input(Time_Input *self, Scene *scene, Input_Sta
 
 bool get_formatted_current_time(char *buf, i32 bufsize)
 {
+#ifdef _WIN32
 	// TODO unix
 	// xx for sub-millisecond precision, could use timer path(GetSystemTimePreciseAsFileTime)
 	// and convert
@@ -699,6 +712,13 @@ bool get_formatted_current_time(char *buf, i32 bufsize)
 	i32 n = snprintf(buf, bufsize, "%02d:%02d:%02d %s", loctime.wHour, loctime.wMinute,
 		loctime.wSecond, ampm);
 	return n < bufsize;
+#else
+	time_t t;
+	time(&t);
+	struct tm *tm = localtime(&t);
+	size_t n = strftime(buf, bufsize, "%I:%M:%S %p", tm);
+	return n < bufsize;
+#endif
 }
 
 void clock_draw_and_respond_input(Clock *self, Scene *scene, Input_State *input)
@@ -1028,7 +1048,7 @@ Layout_Target get_layout_target_for_point_recurse(Layout_Node *node, float w, fl
 		} break;
 		case SPLIT_VERTICAL: {
 			side_e side = y < h - y ? SIDE_TOP : SIDE_BOTTOM;
-			float dist = min(y, h - y);
+			float dist = MIN(y, h - y);
 			float my_score = 10000.0f - dist;
 			Layout_Target my_target = { node, -1, side, my_score };
 			float child_y = 0;
