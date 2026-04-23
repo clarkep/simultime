@@ -1,7 +1,6 @@
 # SimulTime: clock, timer and stopwatch
 
-Inspired by the fact that OS Clock apps don't let you set more than one stopwatch, SimulTime
-lets you have whatever clocks you want, in whatever arrangement you want.
+Inspired by the fact that OS Clock apps don't let you set more than one stopwatch, SimulTime lets you have whatever clocks you want, in whatever arrangement you want.
 
 ![screenshot](simultime.png)
 
@@ -17,3 +16,8 @@ Run the build script in a [VS Developer Command Prompt](https://learn.microsoft.
 
      > build.bat
 
+### Linux
+
+Run the build script. SDL3 and freetype libraries and headers must be installed(Ubuntu: `libsdl3-dev` and `libfreetype-dev`).
+
+    $ build.sh
