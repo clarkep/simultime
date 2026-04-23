@@ -1,8 +1,6 @@
 #ifndef AU_DRAW_H
 #define AU_DRAW_H
 
-#include "stb_truetype.h"
-
 #include "au_core.h"
 #include "au_math.h"
 #include "au_window.h"
