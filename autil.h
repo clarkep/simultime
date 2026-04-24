@@ -516,6 +516,9 @@ bool au_window_set_cursor(Window *window, i32 cursor);
 
 i32 au_window_load_sound(Window *window, const char *path, const char *type);
 
+i32 au_window_load_sound_from_memory(Window *window, const void *data, u64 length,
+	const char *type);
+
 void au_window_play_sound(Window *window, i32 sound_i);
 
 void close_window(Window *window);

@@ -4,6 +4,13 @@
 #include <stdio.h>
 #include <math.h>
 
+#include "res/NotoSans-Regular.h"
+#include "res/chime.h"
+#include "res/clock.h"
+#include "res/timer.h"
+#include "res/sw.h"
+#include "res/x_button.h"
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define VC_EXTRALEAN
@@ -1849,7 +1856,7 @@ int main(int argc, char *argv[])
 	Input_State *input = win->input;
 	float dpi = win->scale;
 
-	i32 font = load_font(scene, "NotoSans-Regular.ttf");
+	i32 font = load_font_from_memory(scene, NotoSans_Regular_ttf, NotoSans_Regular_ttf_len);
 
 	App *app = (App *) aalloc(&app_arena, sizeof(App));
 	g_app = app;
@@ -1871,18 +1878,23 @@ int main(int argc, char *argv[])
 		.overlay_color = 0x803030c0,
 	};
 
+	// This calls into SDL_OpenAudioDeviceStream and is the cause of our unfortunate startup
+	// lag(for me about 500ms). Todo: move to background thread.
+	app->chime_wav = au_window_load_sound_from_memory(win, chime_wav, chime_wav_len, "wav");
+
 	float icon_size = (settings.bottom_bar_height - 8)*dpi;
 	app->icon_size = icon_size;
-	app->clock_svg = load_image_at_size(scene, "res/clock.svg", "svg_alpha", icon_size, icon_size);
-	app->timer_svg = load_image_at_size(scene, "res/timer.svg", "svg_alpha", icon_size, icon_size);
-	app->stopwatch_svg = load_image_at_size(scene, "res/sw.svg", "svg_alpha", icon_size, icon_size);
-
-	app->chime_wav = au_window_load_sound(win, "res/chime.wav", "wav");
+	app->clock_svg = load_image_at_size_from_memory(scene, clock_svg, clock_svg_len, "svg_alpha",
+		icon_size, icon_size);
+	app->timer_svg = load_image_at_size_from_memory(scene, timer_svg, timer_svg_len, "svg_alpha",
+		icon_size, icon_size);
+	app->stopwatch_svg = load_image_at_size_from_memory(scene, sw_svg, sw_svg_len, "svg_alpha",
+		icon_size, icon_size);
 
 	// TODO: reload svgs on rescale
 	float x_button_size = settings.x_button_size_unscaled*dpi;
-	settings.x_button = load_image_at_size(scene, "res/x_button.svg", "svg_alpha", x_button_size,
-		x_button_size);
+	settings.x_button = load_image_at_size_from_memory(scene, x_button_svg, x_button_svg_len,
+		"svg_alpha", x_button_size, x_button_size);
 
 	app->layout_root = create_split_group_node(&app_arena, SPLIT_HORIZONTAL);
 	Layout_Node *tabs = create_tab_group_node(&app_arena);

@@ -16,9 +16,7 @@ Last updated 2026-03-15
 #define WIN32_LEAN_AND_MEAN
 #define VC_EXTRALEAN
 #include <windows.h>
-#include <shellscalingapi.h>
-
-// GetDpiForMonitor (Shcore.lib)
+#include <shellscalingapi.h> // GetDpiForMonitor (Shcore.lib)
 // These libraries are required by SDL; listing them here prevents the user from having to list them
 // on the cl command line.
 #pragma comment(lib, "user32.lib")
@@ -412,7 +410,7 @@ bool au_window_set_cursor(Window *window, i32 cursor)
             SDL_SetCursor(g_cursor_handles[cursor]);
             return true;
         } else {
-            SDL_Cursor *result;
+            HANDLE result;
             switch (cursor) {
             case AU_CURSOR_NORMAL:
                 result = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
@@ -466,6 +464,44 @@ i32 au_window_load_sound(Window *window, const char *path, const char *type)
 		AU_SDL_Audio_Buffer abuf;
 		bool res = SDL_LoadWAV(path, &abuf.spec, &abuf.buf, &abuf.len);
 		if (res) {
+			i32 ret = win->audio_buffers->length;
+			dynarray_add(win->audio_buffers, &abuf);
+			return ret;
+		} else {
+			return -1;
+		}
+	} else {
+		return -1;
+	}
+}
+
+i32 au_window_load_sound_from_memory(Window *window, const void *data, u64 length,
+	const char *type)
+{
+	AU_SDL_Window *win = (AU_SDL_Window *) window;
+	if (!win->audio_buffers) {
+		SDL_Init(SDL_INIT_AUDIO);
+		win->audio_buffers = (AU_SDL_Audio_Buffer_Dynarray *) new_dynarray(window->arena,
+			sizeof(AU_SDL_Audio_Buffer));
+	}
+	if (!strcmp(type, "wav")) {
+		AU_SDL_Audio_Buffer abuf;
+		SDL_IOStream *io = SDL_IOFromConstMem(data, length);
+		bool res = SDL_LoadWAV_IO(io, true, &abuf.spec, &abuf.buf, &abuf.len);
+		if (res) {
+			if (!win->audio_stream) {
+				win->audio_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+					&abuf.spec, NULL, NULL);
+				if (!win->audio_stream) {
+					// errexit("Failed to open audio stream\n");
+					return -1;
+				}
+				bool result = SDL_ResumeAudioStreamDevice(win->audio_stream);
+				if (!result) {
+					// errexit("Failed to resume audio stream\n");
+					return -1;
+				}
+			}
 			i32 ret = win->audio_buffers->length;
 			dynarray_add(win->audio_buffers, &abuf);
 			return ret;
