@@ -1,10 +1,10 @@
-# SimulTime: clock, timer and stopwatch
+# SimulTime
 
-_Warning: this project is incomplete._
+_Warning: this project is incomplete/under development._
 
-Inspired by the fact that OS Clock apps don't let you set more than one stopwatch, SimulTime lets you have whatever clocks you want, in whatever arrangement you want.
+Simultime is a clock/timer/stopwatch app with support for tabs and split views.
 
-This app was originally built as part of the [Handmade Essentials Jam 2026](https://handmade.network/jam/essentials) ([project page](https://handmade.network/p/800/simultime/)). As per the jam rules, no AI code generation was used in its creation(the library code in `autil/` was written before the jam, and did make very minor use of AI assistance). Subsequent updates will continue to use no AI codegen.
+This app was originally built as part of the [Handmade Essentials Jam 2026](https://handmade.network/jam/essentials) ([project page](https://handmade.network/p/800/simultime/)). As per the jam rules, no AI code generation was used in its creation(the library code in `autil/` was written before the jam, and did make very minor use of AI assistance). Subsequent updates will continue to be done without AI codegen.
 
 ![screenshot](simultime.png)
 
